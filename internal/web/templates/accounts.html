@@ -1,0 +1,72 @@
+{{define "content"}}
+<h2>DNS providers</h2>
+<p class="sub">Credentials for the registrars and DNS hosts this connector talks to. Stored in this
+app's private database; secrets are never rendered back to the browser.</p>
+
+<div class="panel">
+  {{if .Accounts}}
+  <table>
+    <thead><tr><th>Name</th><th>Provider</th><th>Zones</th><th></th></tr></thead>
+    <tbody>
+    {{range .Accounts}}
+      <tr>
+        <td>{{.Label}}</td>
+        <td>{{.ProviderLabel}} <span class="tag">{{.Provider}}</span></td>
+        <td class="mono">{{if .Zones}}{{range $i, $z := .Zones}}{{if $i}}, {{end}}{{$z}}{{end}}{{else}}—{{end}}</td>
+        <td style="text-align:right">
+          <form method="post" action="/accounts/delete" style="display:inline"
+                onsubmit="return confirm('Delete {{.Label}}? Any zones bound to it are removed too.')">
+            <input type="hidden" name="id" value="{{.ID}}">
+            <button class="ghost" type="submit">Delete</button>
+          </form>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+    <div class="empty">No provider accounts yet.</div>
+  {{end}}
+</div>
+
+<h3>Add a provider</h3>
+<div class="panel">
+  <form method="get" action="/accounts">
+    <div class="row">
+      <div class="field">
+        <label for="provider">Provider</label>
+        <select id="provider" name="provider" onchange="this.form.submit()">
+          {{range .Providers}}
+            <option value="{{.Key}}" {{if eq .Key $.Selected.Key}}selected{{end}}>{{.Label}}</option>
+          {{end}}
+        </select>
+      </div>
+      <div class="field narrow"><button type="submit">Choose</button></div>
+    </div>
+  </form>
+
+  <form method="post" action="/accounts/add">
+    <input type="hidden" name="provider" value="{{.Selected.Key}}">
+    <div class="field">
+      <label for="label">Name for this account</label>
+      <input id="label" name="label" placeholder="{{.Selected.Label}} — main" required>
+    </div>
+    {{range .Selected.Fields}}
+      <div class="field">
+        <label for="f-{{.Key}}">{{.Label}}{{if not .Required}} <span class="tag">optional</span>{{end}}</label>
+        <input id="f-{{.Key}}" name="{{.Key}}" {{if .Secret}}type="password" autocomplete="new-password"{{end}}>
+        {{if .Help}}<div class="help">{{.Help}}</div>{{end}}
+      </div>
+    {{end}}
+    {{if not .Selected.Fields}}
+      <p class="sub">This provider needs no credentials.</p>
+    {{end}}
+    <button type="submit">Save provider</button>
+    {{if .Selected.DocURL}}
+      <span class="sub" style="margin-left:12px">
+        <a href="{{.Selected.DocURL}}" target="_blank" rel="noreferrer noopener">How to get these credentials ↗</a>
+      </span>
+    {{end}}
+  </form>
+</div>
+{{end}}

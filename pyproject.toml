@@ -1,0 +1,22 @@
+[project]
+name = "external-dns-connector-tests"
+version = "0.1.0"
+description = "Integration tests for the external-dns-connector OpenHost app"
+requires-python = "==3.12.*"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-playwright",
+    "playwright",
+    "httpx>=0.27",
+    # Builds the app's Dockerfile, runs it under podman with the mounts/env its cloudinabottle.toml
+    # declares, and fronts it with the real OpenHost router (real subdomain routing and cookie auth).
+    # Requires podman on the host.
+    "openhost[test-harness] @ git+https://github.com/imbue-openhost/openhost@main",
+]
+
+[tool.pytest.ini_options]
+addopts = "-v"
+testpaths = ["tests"]

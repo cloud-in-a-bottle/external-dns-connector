@@ -1,0 +1,28 @@
+# Go
+/dns-connector
+*.test
+
+# Local app data
+*.db
+*.db-wal
+*.db-shm
+
+# Python test deps
+.venv/
+.python-version
+__pycache__/
+*.py[cod]
+
+# Playwright
+test-results/
+playwright-report/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Claude
+.claude/settings.json
+.claude/settings.local.json

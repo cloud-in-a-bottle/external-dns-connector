@@ -1,0 +1,25 @@
+{{define "content"}}
+<h2>Activity</h2>
+<p class="sub">Every record change and configuration edit, with the app or user that made it.</p>
+
+<div class="panel">
+  {{if .Entries}}
+  <table>
+    <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Zone</th><th>Detail</th></tr></thead>
+    <tbody>
+    {{range .Entries}}
+      <tr>
+        <td class="mono">{{.When}}</td>
+        <td>{{.Actor}}</td>
+        <td class="mono">{{.Op}}{{if not .OK}} <span class="tag" style="color:var(--bad)">failed</span>{{end}}</td>
+        <td class="mono">{{.Zone}}</td>
+        <td class="mono" style="color:var(--dim)">{{if .Error}}{{.Error}}{{else}}{{.Detail}}{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+    <div class="empty">Nothing has happened yet.</div>
+  {{end}}
+</div>
+{{end}}
