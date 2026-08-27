@@ -144,16 +144,21 @@ func (o *Ops) Get(ctx context.Context, z store.Zone) ([]libdns.Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	getter, ok := p.(libdns.RecordGetter)
-	if !ok {
-		return nil, fmt.Errorf("provider %s cannot read records", z.Provider)
-	}
-	recs, err := getter.GetRecords(ctx, z.Zone+".")
+	recs, err := fetch(ctx, p, z)
 	if err != nil {
 		return nil, err
 	}
 	o.putCache(z.Zone, recs)
 	return recs, nil
+}
+
+// fetch reads a zone straight from its provider. Callers must already hold the zone lock.
+func fetch(ctx context.Context, p any, z store.Zone) ([]libdns.Record, error) {
+	getter, ok := p.(libdns.RecordGetter)
+	if !ok {
+		return nil, fmt.Errorf("provider %s cannot read records", z.Provider)
+	}
+	return getter.GetRecords(ctx, z.Zone+".")
 }
 
 type WriteOp string
@@ -192,14 +197,63 @@ func (o *Ops) Write(ctx context.Context, z store.Zone, op WriteOp, recs []libdns
 		}
 		return appender.AppendRecords(ctx, fqdn, recs)
 	case OpDelete:
-		deleter, ok := p.(libdns.RecordDeleter)
-		if !ok {
-			return nil, fmt.Errorf("provider %s cannot delete records", z.Provider)
-		}
-		return deleter.DeleteRecords(ctx, fqdn, recs)
+		return deleteRecords(ctx, p, z, recs)
 	default:
 		return nil, fmt.Errorf("unknown write operation %q", op)
 	}
+}
+
+// Delete removes records from a zone: `exact` records must match completely, while `clears` name
+// whole (name, type) RRsets to remove whatever they currently hold.
+//
+// The clears are expanded here rather than passed down as libdns's empty-field wildcard. libdns says
+// an implementation *may* treat an empty Data as "match anything", and in practice they disagree —
+// libdns/porkbun deletes by name and type and ignores Data entirely, libdns/cloudflare matches
+// exactly. Reading the zone and deleting the concrete records gives the same behavior on all of
+// them, which is what a cleanup path recovering from a crashed run needs.
+//
+// The read and the delete happen under one hold of the zone lock, so no other caller of this app can
+// add a record in between and have it survive the clear.
+func (o *Ops) Delete(
+	ctx context.Context, z store.Zone, exact []libdns.Record, clears []records.RRset,
+) ([]libdns.Record, error) {
+	lock := o.zoneLock(z.Zone)
+	lock.Lock()
+	defer lock.Unlock()
+	defer o.InvalidateZone(z.Zone)
+
+	p, err := o.provider(z)
+	if err != nil {
+		return nil, err
+	}
+
+	toDelete := exact
+	if len(clears) > 0 {
+		existing, err := fetch(ctx, p, z)
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range existing {
+			for _, set := range clears {
+				if set.Matches(rec) {
+					toDelete = append(toDelete, rec)
+					break
+				}
+			}
+		}
+	}
+	if len(toDelete) == 0 {
+		return nil, nil
+	}
+	return deleteRecords(ctx, p, z, toDelete)
+}
+
+func deleteRecords(ctx context.Context, p any, z store.Zone, recs []libdns.Record) ([]libdns.Record, error) {
+	deleter, ok := p.(libdns.RecordDeleter)
+	if !ok {
+		return nil, fmt.Errorf("provider %s cannot delete records", z.Provider)
+	}
+	return deleter.DeleteRecords(ctx, z.Zone+".", recs)
 }
 
 // ListProviderZones asks a provider which zones it can see, for the owner UI's zone picker. Not every

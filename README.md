@@ -85,6 +85,20 @@ unescaped zone-file RDATA, so `MX` is `"10 mail.example.com."` and `SRV` is
 Writable types: `A`, `AAAA`, `CAA`, `CNAME`, `MX`, `NS`, `SRV`, `TXT` — the basics plus what email
 needs. Reads pass through whatever the provider returns.
 
+### Clearing an RRset
+
+On `records/delete`, omitting `data` clears the whole `(name, type)` RRset instead of matching one
+exact record:
+
+```json
+{"zone": "example.com", "records": [{"name": "_acme-challenge", "type": "TXT"}]}
+```
+
+This is what an unconditional cleanup path needs — a process that died before recording the value it
+wrote cannot delete by exact value. Clearing a name that holds nothing succeeds and reports nothing
+deleted, so it is safe to call in a `finally` or on a retry. Grants are checked on `(name, type)`
+either way.
+
 The full spec is in [`services/dns/openapi.yaml`](services/dns/openapi.yaml).
 
 ## Development

@@ -200,19 +200,28 @@ func (a *API) write(op dnsops.WriteOp) consumerHandler {
 		// Parse for every target zone before writing to any of them. The zone-relative name check is
 		// zone-dependent, so a fan-out could otherwise accept a name for one zone and reject it for
 		// another, leaving the write half-applied across the owner's domains.
-		parsed := make(map[string][]libdns.Record, len(zones))
+		parsed := make(map[string]batch, len(zones))
 		for _, z := range zones {
-			recs, err := parseAll(req.Records, z.Zone)
+			b, err := parseBatch(req.Records, z.Zone, op)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, "invalid_record", err.Error())
 				return
 			}
-			parsed[z.Zone] = recs
+			parsed[z.Zone] = b
 		}
 
 		results := make([]dnsops.ZoneResult, 0, len(zones))
 		for _, z := range zones {
-			applied, err := a.ops.Write(r.Context(), z, op, parsed[z.Zone])
+			b := parsed[z.Zone]
+			var (
+				applied []libdns.Record
+				err     error
+			)
+			if op == dnsops.OpDelete {
+				applied, err = a.ops.Delete(r.Context(), z, b.exact, b.clears)
+			} else {
+				applied, err = a.ops.Write(r.Context(), z, op, b.exact)
+			}
 			if err != nil {
 				results = append(results, dnsops.ZoneResult{Zone: z.Zone, OK: false, Error: err.Error()})
 				continue
@@ -226,16 +235,33 @@ func (a *API) write(op dnsops.WriteOp) consumerHandler {
 	}
 }
 
-func parseAll(wire []records.Wire, zone string) ([]libdns.Record, error) {
-	out := make([]libdns.Record, 0, len(wire))
+// batch is one request's records resolved against one zone. On a delete, a record given without
+// data selects the whole (name, type) RRset instead of one exact record.
+type batch struct {
+	exact  []libdns.Record
+	clears []records.RRset
+}
+
+func parseBatch(wire []records.Wire, zone string, op dnsops.WriteOp) (batch, error) {
+	var b batch
 	for _, w := range wire {
+		// Omitting data means "whatever is there now", which only makes sense when removing records.
+		// A set or append with no data is a mistake, not a wildcard.
+		if strings.TrimSpace(w.Data) == "" && op == dnsops.OpDelete {
+			set, err := w.ToRRset(zone)
+			if err != nil {
+				return batch{}, err
+			}
+			b.clears = append(b.clears, set)
+			continue
+		}
 		rec, err := w.ToLibDNS(zone)
 		if err != nil {
-			return nil, err
+			return batch{}, err
 		}
-		out = append(out, rec)
+		b.exact = append(b.exact, rec)
 	}
-	return out, nil
+	return b, nil
 }
 
 func (a *API) audit(caller auth.Caller, op, zone string, detail any, results []dnsops.ZoneResult) {

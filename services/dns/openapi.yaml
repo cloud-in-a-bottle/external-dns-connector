@@ -144,9 +144,19 @@ paths:
 
   /records/delete:
     post:
-      summary: Delete records that exactly match the input
-      description: Records that do not exist are silently ignored, per libdns semantics.
-      requestBody: {$ref: "#/components/requestBodies/Write"}
+      summary: Delete records, or clear a whole RRset
+      description: |
+        A record given **with** `data` deletes only that exact record. A record given **without**
+        `data` clears the whole `(name, type)` RRset, removing whatever it currently holds.
+
+        The second form is what an unconditional cleanup path needs: a process that died before
+        recording the value it wrote cannot delete by exact value. Clearing a name that holds nothing
+        succeeds and reports nothing deleted, so the call is safe to make unconditionally.
+
+        Grants are checked the same way either way — on `(name, type)`.
+
+        Records that do not exist are silently ignored, per libdns semantics.
+      requestBody: {$ref: "#/components/requestBodies/Delete"}
       responses:
         "200": {$ref: "#/components/responses/Results"}
         "207": {$ref: "#/components/responses/Results"}
@@ -156,6 +166,34 @@ paths:
 
 components:
   requestBodies:
+    Delete:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [zone, records]
+            properties:
+              zone:
+                type: string
+                description: A configured zone, or `*` for all of them. Required.
+                example: example.com
+              records:
+                type: array
+                minItems: 1
+                items: {$ref: "#/components/schemas/DeleteTarget"}
+          examples:
+            exact:
+              summary: Delete one specific record
+              value:
+                zone: example.com
+                records: [{name: _acme-challenge, type: TXT, ttl: 60, data: "the-token"}]
+            clearRRset:
+              summary: Clear the whole RRset, whatever it holds
+              value:
+                zone: example.com
+                records: [{name: _acme-challenge, type: TXT}]
+
     Write:
       required: true
       content:
@@ -249,6 +287,27 @@ components:
           type: string
           description: Unescaped zone-file RDATA.
           example: 192.0.2.1
+
+    DeleteTarget:
+      type: object
+      required: [name, type]
+      description: |
+        A record to remove. With `data`, only that exact record is deleted. Without it, the whole
+        `(name, type)` RRset is cleared and `ttl` is ignored.
+      properties:
+        name:
+          type: string
+          description: Zone-relative name; `@` for the apex.
+          example: _acme-challenge
+        type:
+          type: string
+          enum: [A, AAAA, CAA, CNAME, MX, NS, SRV, TXT]
+        ttl:
+          type: integer
+          description: Seconds. Ignored when `data` is omitted.
+        data:
+          type: string
+          description: Omit to clear the whole RRset.
 
     Grant:
       type: object

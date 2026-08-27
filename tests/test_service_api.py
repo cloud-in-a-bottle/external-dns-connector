@@ -165,3 +165,39 @@ def test_zone_listing_needs_a_grant(stack: OpenhostStack, zones: list[str], acme
     stack.grant(ungranted.app_id, SERVICE_URL, READ_ALL_GRANT)
     allowed = ungranted.call("zones", None)
     assert allowed.status == 200, allowed.body
+
+
+def test_clearing_an_rrset_needs_no_knowledge_of_its_contents(acme_app: ServiceConsumer) -> None:
+    """The cleanup case: a run that crashed before recording its token can still wipe the name."""
+    for token in ("stale-one", "stale-two"):
+        assert (
+            acme_app.call(
+                "records/append",
+                {"zone": ZONE_A, "records": [{"name": "_acme-challenge.crashed", "type": "TXT", "ttl": 60, "data": token}]},
+            ).status
+            == 200
+        )
+
+    cleared = acme_app.call(
+        "records/delete",
+        {"zone": ZONE_A, "records": [{"name": "_acme-challenge.crashed", "type": "TXT"}]},
+    )
+    assert cleared.status == 200, cleared.body
+    assert len(cleared.body["results"][0]["records"]) == 2, cleared.body
+
+    got = acme_app.call("records/get", {"zone": ZONE_A, "name": "_acme-challenge.crashed"})
+    assert got.body["results"][0]["records"] == [], got.body
+
+    # Safe to run unconditionally: clearing a name that holds nothing is a no-op, not an error.
+    again = acme_app.call(
+        "records/delete",
+        {"zone": ZONE_A, "records": [{"name": "_acme-challenge.crashed", "type": "TXT"}]},
+    )
+    assert again.status == 200, again.body
+    assert again.body["results"][0]["records"] == []
+
+
+def test_clearing_an_rrset_outside_the_grant_is_refused(acme_app: ServiceConsumer) -> None:
+    r = acme_app.call("records/delete", {"zone": ZONE_A, "records": [{"name": "home", "type": "A"}]})
+    assert r.status == 403, r.body
+    assert r.body["error"] == "permission_required"

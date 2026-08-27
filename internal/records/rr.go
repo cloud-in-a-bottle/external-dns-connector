@@ -55,6 +55,38 @@ func (w Wire) ToLibDNS(zone string) (libdns.Record, error) {
 	return rec, nil
 }
 
+// RRset names every record sharing a name and type. Deleting one is how a caller clears a name
+// without knowing what is currently there — an ACME solver cleaning up after a run that crashed
+// before it recorded the token it wrote cannot delete by exact value.
+type RRset struct {
+	Name string
+	Type string
+}
+
+// ToRRset validates a wire record as an RRset selector. Only the name and type are meaningful; the
+// TTL and data are ignored, since the point is to match whatever happens to be there.
+func (w Wire) ToRRset(zone string) (RRset, error) {
+	name, err := NormalizeName(w.Name, zone)
+	if err != nil {
+		return RRset{}, err
+	}
+	rrtype, err := NormalizeType(w.Type)
+	if err != nil {
+		return RRset{}, err
+	}
+	return RRset{Name: name, Type: rrtype}, nil
+}
+
+// Matches reports whether a record belongs to this RRset.
+func (r RRset) Matches(rec libdns.Record) bool {
+	rr := rec.RR()
+	name := rr.Name
+	if name == "" {
+		name = Apex
+	}
+	return strings.EqualFold(name, r.Name) && strings.EqualFold(rr.Type, r.Type)
+}
+
 // FromLibDNS reduces any libdns record to the wire shape.
 func FromLibDNS(rec libdns.Record) Wire {
 	rr := rec.RR()

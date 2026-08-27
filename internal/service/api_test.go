@@ -342,3 +342,80 @@ func TestUngrantedAppLearnsNothingAboutZones(t *testing.T) {
 		t.Error("the error revealed whether a zone exists to an app with no grants")
 	}
 }
+
+// Clearing an RRset by omitting data is what a cleanup path needs: a run that crashed before it
+// recorded the token it wrote cannot delete by exact value.
+func TestDeleteWithoutDataClearsTheWholeRRset(t *testing.T) {
+	h := newTestAPI(t)
+	perms := globalGrant("**", "TXT", "rw")
+	seed := map[string]any{"zone": zoneA, "records": []map[string]any{
+		{"name": "_acme-challenge", "type": "TXT", "ttl": 60, "data": "token-one"},
+		{"name": "_acme-challenge", "type": "TXT", "ttl": 60, "data": "token-two"},
+		{"name": "keep", "type": "TXT", "ttl": 60, "data": "untouched"},
+	}}
+	if code, _, raw := call(t, h, "/records/append", seed, perms); code != http.StatusOK {
+		t.Fatalf("seed failed: %d %v", code, raw)
+	}
+
+	clear := map[string]any{"zone": zoneA, "records": []map[string]any{
+		{"name": "_acme-challenge", "type": "TXT"},
+	}}
+	code, res, raw := call(t, h, "/records/delete", clear, perms)
+	if code != http.StatusOK {
+		t.Fatalf("clear returned %d %v", code, raw)
+	}
+	if len(res.Results[0].Records) != 2 {
+		t.Errorf("expected both tokens reported deleted, got %+v", res.Results[0].Records)
+	}
+
+	_, res, _ = call(t, h, "/records/get", map[string]any{"zone": zoneA}, perms)
+	got := res.Results[0].Records
+	if len(got) != 1 || got[0].Name != "keep" {
+		t.Errorf("the clear should have removed only the _acme-challenge RRset, leaving %+v", got)
+	}
+}
+
+// The clear must respect the same grant check as any other write.
+func TestClearingAnRRsetOutsideTheGrantIsRefused(t *testing.T) {
+	h := newTestAPI(t)
+	body := map[string]any{"zone": zoneA, "records": []map[string]any{
+		{"name": "home", "type": "A"},
+	}}
+	code, _, raw := call(t, h, "/records/delete", body, acmeGrant)
+	if code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d %v", code, raw)
+	}
+	if raw["error"] != "permission_required" {
+		t.Errorf("got %v", raw)
+	}
+}
+
+// Clearing a name that holds nothing is a no-op, not an error: a cleanup path runs unconditionally
+// and should not have to know whether a previous run got as far as writing anything.
+func TestClearingAnEmptyRRsetSucceeds(t *testing.T) {
+	h := newTestAPI(t)
+	body := map[string]any{"zone": zoneA, "records": []map[string]any{
+		{"name": "_acme-challenge.never-written", "type": "TXT"},
+	}}
+	code, res, raw := call(t, h, "/records/delete", body, acmeGrant)
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d %v", code, raw)
+	}
+	if len(res.Results[0].Records) != 0 {
+		t.Errorf("nothing should have been deleted, got %+v", res.Results[0].Records)
+	}
+}
+
+// Omitting data is a wildcard only when removing records; on a set or append it is a mistake.
+func TestSetAndAppendStillRequireData(t *testing.T) {
+	h := newTestAPI(t)
+	for _, path := range []string{"/records/set", "/records/append"} {
+		body := map[string]any{"zone": zoneA, "records": []map[string]any{
+			{"name": "_acme-challenge.x", "type": "TXT"},
+		}}
+		code, _, raw := call(t, h, path, body, acmeGrant)
+		if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
+			t.Errorf("%s with no data: expected 400 invalid_record, got %d %v", path, code, raw)
+		}
+	}
+}
