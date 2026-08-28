@@ -6,12 +6,34 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/cloud-in-a-bottle/external-dns-connector/internal/lifecycle"
 )
 
 type fakeLifecycle struct {
 	listenAndServe func() error
 	shutdown       func(context.Context) error
 	close          func() error
+}
+
+func TestLifecycleTimeoutOrdering(t *testing.T) {
+	if lifecycle.ProviderTimeout != 20*time.Second ||
+		lifecycle.ServiceRequestTimeout != 25*time.Second ||
+		lifecycle.ShutdownTimeout != 30*time.Second ||
+		lifecycle.ServerWriteTimeout != 60*time.Second {
+		t.Fatalf(
+			"timeouts = provider:%s request:%s shutdown:%s write:%s",
+			lifecycle.ProviderTimeout,
+			lifecycle.ServiceRequestTimeout,
+			lifecycle.ShutdownTimeout,
+			lifecycle.ServerWriteTimeout,
+		)
+	}
+	if lifecycle.ProviderTimeout >= lifecycle.ServiceRequestTimeout ||
+		lifecycle.ServiceRequestTimeout >= lifecycle.ShutdownTimeout ||
+		lifecycle.ServiceRequestTimeout >= lifecycle.ServerWriteTimeout {
+		t.Fatal("timeouts must satisfy provider < request < shutdown and request < server write")
+	}
 }
 
 func (f *fakeLifecycle) ListenAndServe() error {

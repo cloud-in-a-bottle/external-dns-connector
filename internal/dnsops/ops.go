@@ -11,6 +11,7 @@ import (
 	"github.com/libdns/libdns"
 
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/dnsprov"
+	"github.com/cloud-in-a-bottle/external-dns-connector/internal/lifecycle"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/records"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/store"
 )
@@ -25,10 +26,6 @@ var ErrUnknownZone = errors.New("unknown zone")
 // cacheTTL bounds how stale a read may be. Provider APIs are rate-limited, and without this a busy
 // consumer polling records would exhaust that budget on its own.
 const cacheTTL = 30 * time.Second
-
-// The router normally allows 30 seconds for a service response. Keeping provider work below that
-// leaves time to serialize and return a useful error before the connection is closed.
-const defaultProviderTimeout = 20 * time.Second
 
 type contextLock struct {
 	token chan struct{}
@@ -111,7 +108,7 @@ func New(s *store.Store, options ...Option) *Ops {
 		locks:   map[string]*contextLock{},
 		cache:   map[cacheKey]cacheEntry{},
 		nowFn:   time.Now,
-		timeout: defaultProviderTimeout,
+		timeout: lifecycle.ProviderTimeout,
 	}
 	for _, option := range options {
 		option(o)

@@ -67,6 +67,10 @@ domain the owner runs.
 Since a write can fan out, responses report per zone, and the status reflects the whole: `200` when
 every zone succeeded, `207` when some did, `502` when none did.
 
+Provider APIs are not transactionally atomic across RRsets. If one zone request changes multiple
+RRsets and a later RRset fails, earlier changes remain applied. A failed zone result may therefore
+contain `records` that were successfully applied before its `error`; callers should inspect both.
+
 ### Records
 
 One flat shape covers every type, mirroring a zone file line:

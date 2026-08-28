@@ -1,29 +1,108 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/libdns/libdns"
 
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/auth"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/dnsops"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/grants"
+	"github.com/cloud-in-a-bottle/external-dns-connector/internal/lifecycle"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/records"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/store"
 )
 
+const maxZoneWorkers = 4
+
+type recordOperations interface {
+	ResolveZones(string) ([]store.Zone, error)
+	Get(context.Context, store.Zone) ([]libdns.Record, error)
+	Write(context.Context, store.Zone, dnsops.WriteOp, []libdns.Record) ([]libdns.Record, error)
+	Delete(context.Context, store.Zone, []libdns.Record, []records.RRset) ([]libdns.Record, error)
+}
+
 type API struct {
-	store *store.Store
-	ops   *dnsops.Ops
+	store          *store.Store
+	ops            recordOperations
+	requestTimeout time.Duration
 }
 
 func New(s *store.Store, ops *dnsops.Ops) *API {
-	return &API{store: s, ops: ops}
+	return newAPI(s, ops)
+}
+
+func newAPI(s *store.Store, ops recordOperations) *API {
+	return &API{store: s, ops: ops, requestTimeout: lifecycle.ServiceRequestTimeout}
+}
+
+type zoneOperation func(context.Context, store.Zone) ([]records.Wire, error)
+
+func (a *API) executeZones(
+	parent context.Context,
+	zones []store.Zone,
+	operation zoneOperation,
+) []dnsops.ZoneResult {
+	ctx, cancel := context.WithTimeout(parent, a.requestTimeout)
+	defer cancel()
+	return fanOutZones(ctx, zones, operation)
+}
+
+func fanOutZones(
+	ctx context.Context,
+	zones []store.Zone,
+	operation zoneOperation,
+) []dnsops.ZoneResult {
+	results := make([]dnsops.ZoneResult, len(zones))
+	if len(zones) == 0 {
+		return results
+	}
+
+	jobs := make(chan int, len(zones))
+	for index := range zones {
+		jobs <- index
+	}
+	close(jobs)
+
+	workerCount := min(maxZoneWorkers, len(zones))
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				zone := zones[index]
+				if err := ctx.Err(); err != nil {
+					results[index] = failedZoneResult(zone.Zone, nil, err)
+					continue
+				}
+
+				records, err := operation(ctx, zone)
+				if err == nil {
+					err = ctx.Err()
+				}
+				if err != nil {
+					results[index] = failedZoneResult(zone.Zone, records, err)
+					continue
+				}
+				results[index] = dnsops.ZoneResult{Zone: zone.Zone, OK: true, Records: records}
+			}
+		}()
+	}
+	workers.Wait()
+	return results
+}
+
+func failedZoneResult(zone string, applied []records.Wire, err error) dnsops.ZoneResult {
+	return dnsops.ZoneResult{Zone: zone, Records: applied, Error: err.Error()}
 }
 
 // Handler mounts the service routes. Everything here is reachable only through the router's service
@@ -115,12 +194,13 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request, caller auth.Call
 	nameFilter := strings.ToLower(strings.TrimSpace(req.Name))
 	typeFilter := strings.ToUpper(strings.TrimSpace(req.Type))
 
-	results := make([]dnsops.ZoneResult, 0, len(zones))
-	for _, z := range zones {
-		recs, err := a.ops.Get(r.Context(), z)
+	results := a.executeZones(r.Context(), zones, func(
+		ctx context.Context,
+		z store.Zone,
+	) ([]records.Wire, error) {
+		recs, err := a.ops.Get(ctx, z)
 		if err != nil {
-			results = append(results, dnsops.ZoneResult{Zone: z.Zone, OK: false, Error: err.Error()})
-			continue
+			return nil, err
 		}
 		visible := []records.Wire{}
 		for _, rec := range recs {
@@ -136,8 +216,8 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request, caller auth.Call
 			}
 			visible = append(visible, wire)
 		}
-		results = append(results, dnsops.ZoneResult{Zone: z.Zone, OK: true, Records: visible})
-	}
+		return visible, nil
+	})
 	writeResults(w, results)
 }
 
@@ -278,26 +358,23 @@ func (a *API) write(op dnsops.WriteOp) consumerHandler {
 			parsed[z.Zone] = b
 		}
 
-		results := make([]dnsops.ZoneResult, 0, len(zones))
-		for _, z := range zones {
-			b := parsed[z.Zone]
-			var (
-				applied []libdns.Record
-				err     error
-			)
-			if op == dnsops.OpDelete {
-				applied, err = a.ops.Delete(r.Context(), z, b.exact, b.clears)
-			} else {
-				applied, err = a.ops.Write(r.Context(), z, op, b.exact)
-			}
-			if err != nil {
-				results = append(results, dnsops.ZoneResult{Zone: z.Zone, OK: false, Error: err.Error()})
-				continue
-			}
-			results = append(results, dnsops.ZoneResult{
-				Zone: z.Zone, OK: true, Records: records.FromLibDNSAll(applied),
-			})
-		}
+		results := a.executeZones(
+			r.Context(),
+			zones,
+			func(ctx context.Context, z store.Zone) ([]records.Wire, error) {
+				b := parsed[z.Zone]
+				var (
+					applied []libdns.Record
+					err     error
+				)
+				if op == dnsops.OpDelete {
+					applied, err = a.ops.Delete(ctx, z, b.exact, b.clears)
+				} else {
+					applied, err = a.ops.Write(ctx, z, op, b.exact)
+				}
+				return records.FromLibDNSAll(applied), err
+			},
+		)
 		a.audit(caller, string(op), req.Zone, req.Records, results)
 		writeResults(w, results)
 	}

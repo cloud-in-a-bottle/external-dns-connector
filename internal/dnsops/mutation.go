@@ -76,8 +76,10 @@ func applySemanticMutation(
 	}
 
 	fqdn := z.Zone + "."
+	var result []libdns.Record
 	for _, plan := range plans {
 		if !plan.changed {
+			result = append(result, plan.result...)
 			continue
 		}
 		var err error
@@ -90,12 +92,8 @@ func applySemanticMutation(
 			_, err = deleter.DeleteRecords(ctx, fqdn, plan.records)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%s RRset %s/%s: %w", op, plan.key.name, plan.key.rrtype, err)
+			return result, fmt.Errorf("%s RRset %s/%s: %w", op, plan.key.name, plan.key.rrtype, err)
 		}
-	}
-
-	var result []libdns.Record
-	for _, plan := range plans {
 		result = append(result, plan.result...)
 	}
 	return result, nil

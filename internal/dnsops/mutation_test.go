@@ -34,6 +34,7 @@ type mutationProvider struct {
 	appendCalls []mutationCall
 	deleteCalls []mutationCall
 	setErr      error
+	setErrCall  int
 	appendErr   error
 	deleteErr   error
 }
@@ -58,7 +59,7 @@ func (p *mutationProvider) SetRecords(
 	_ context.Context, zone string, recs []libdns.Record,
 ) ([]libdns.Record, error) {
 	p.setCalls = append(p.setCalls, mutationCall{zone: zone, records: copyRecords(recs)})
-	if p.setErr != nil {
+	if p.setErr != nil && (p.setErrCall == 0 || len(p.setCalls) == p.setErrCall) {
 		return nil, p.setErr
 	}
 	touched := map[rrsetKey]bool{}
@@ -305,6 +306,23 @@ func TestAppendErrorLeavesExistingSiblingRecordsUntouched(t *testing.T) {
 	assertRecords(t, p.records, before)
 	assertProviderCalls(t, p, 1, 0, 0, 1)
 	assertMutationCall(t, p.appendCalls[0], []libdns.Record{added})
+}
+
+func TestMutationReturnsAppliedRRsetsWhenLaterRRsetFails(t *testing.T) {
+	first := testRR("a", "TXT", "applied", 60)
+	second := testRR("b", "TXT", "failed", 60)
+	failure := errors.New("second RRset failed")
+	p := &mutationProvider{setErr: failure, setErrCall: 2}
+
+	got, err := runMutation(t, p, OpSet, []libdns.Record{second, first}, nil)
+	if !errors.Is(err, failure) {
+		t.Fatalf("set returned %v, want %v", err, failure)
+	}
+	assertRecords(t, got, []libdns.Record{first})
+	assertRecords(t, p.records, []libdns.Record{first})
+	assertProviderCalls(t, p, 1, 2, 0, 0)
+	assertMutationCall(t, p.setCalls[0], []libdns.Record{first})
+	assertMutationCall(t, p.setCalls[1], []libdns.Record{second})
 }
 
 func TestExactDeleteErrorLeavesExistingSiblingRecordsUntouched(t *testing.T) {

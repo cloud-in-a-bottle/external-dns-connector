@@ -15,6 +15,7 @@ import (
 
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/config"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/dnsops"
+	"github.com/cloud-in-a-bottle/external-dns-connector/internal/lifecycle"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/service"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/store"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/web"
@@ -23,8 +24,6 @@ import (
 // serviceEndpoint must match the `endpoint` of the [[services.v2.provides]] entry in
 // cloudinabottle.toml — the router proxies service calls to this prefix.
 const serviceEndpoint = "/api/dns/"
-
-const shutdownTimeout = 10 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -62,13 +61,13 @@ func run() error {
 		Handler:           logRequests(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Provider operations have their own shorter deadline; this remains the final response bound.
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: lifecycle.ServerWriteTimeout,
 	}
 
 	log.Printf("dns-connector listening on %s (app %s)", cfg.ListenAddr, cfg.AppName)
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serve(shutdownCtx, srv, shutdownTimeout)
+	return serve(shutdownCtx, srv, lifecycle.ShutdownTimeout)
 }
 
 type serverLifecycle interface {

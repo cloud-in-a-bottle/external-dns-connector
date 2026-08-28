@@ -240,6 +240,9 @@ components:
       description: |
         Per-zone outcomes. The status reflects the whole: `200` when every zone succeeded, `207` when
         some did, `502` when none did — so a total provider outage is never reported as success.
+
+        Provider APIs are not transactionally atomic across RRsets. If a later RRset fails, a failed
+        zone result may contain records successfully applied before the reported error.
       content:
         application/json:
           schema:
@@ -259,6 +262,9 @@ components:
                     ok: {type: boolean}
                     records:
                       type: array
+                      description: |
+                        Records read or successfully mutated. On a failed multi-RRset mutation, this
+                        may contain records applied before a later RRset failed.
                       items: {$ref: "#/components/schemas/ReadRecord"}
                     error: {type: string}
 
