@@ -13,10 +13,14 @@ info:
 
     ## Permission grants
 
-    A grant names a record name pattern, a record type, and an access level:
+    An ACME consumer commonly needs two grants to cover both the zone apex challenge and challenges
+    below it:
 
     ```json
-    {"name": "_acme-challenge.**", "type": "TXT", "access": "rw"}
+    [
+      {"name": "_acme-challenge", "type": "TXT", "access": "rw"},
+      {"name": "_acme-challenge.**", "type": "TXT", "access": "rw"}
+    ]
     ```
 
     * `name` — matched against the **zone-relative** record name (`@` is the zone apex). `**` is the
@@ -25,8 +29,9 @@ info:
     * `type` — an uppercase RR type, or `**` for any type.
     * `access` — `r` for read, `rw` for read and write. `rw` always includes read.
 
-    Grants say nothing about zones. Which zones exist is owner-only configuration that no grant can
-    read or change, and an app addresses zones only by the names this service reports back.
+    Grants say nothing about zones: they apply to matching records in every configured zone. Provider
+    bindings and changes to the configured zone set are owner-only, but any caller with at least one
+    valid, nonempty DNS grant can list every configured zone name through `/zones`.
 
     "Read all" is `{"name": "**", "type": "**", "access": "r"}`; "write all" is the same with `rw`.
 
@@ -38,7 +43,10 @@ info:
     service   = "github.com/cloud-in-a-bottle/external-dns-connector/services/dns"
     shortname = "dns"
     version   = ">=0.1.0"
-    grants    = [{name = "_acme-challenge.**", type = "TXT", access = "rw"}]
+    grants    = [
+      {name = "_acme-challenge", type = "TXT", access = "rw"},
+      {name = "_acme-challenge.**", type = "TXT", access = "rw"},
+    ]
     ```
 
     ## Records
@@ -68,8 +76,8 @@ paths:
     post:
       summary: List the zones this connector manages
       description: |
-        Requires at least one grant — which domains the owner runs is not something an app with no
-        DNS access should learn.
+        Requires at least one valid, nonempty DNS grant — which domains the owner runs is not
+        something an app with no DNS access should learn.
       responses:
         "200":
           description: The configured zones.
@@ -84,7 +92,8 @@ paths:
                     items: {type: string}
                     example: ["example.com", "other.org"]
         "403":
-          $ref: "#/components/responses/PermissionRequired"
+          $ref: "#/components/responses/Forbidden"
+        "500": {$ref: "#/components/responses/InternalError"}
 
   /records/get:
     post:
@@ -93,10 +102,12 @@ paths:
         Returns only the records the caller's grants match; everything else is omitted rather than
         refused, so a narrowly-scoped app sees a zone containing just its own records.
       requestBody:
+        required: true
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 zone:
                   type: string
@@ -111,7 +122,8 @@ paths:
         "200": {$ref: "#/components/responses/Results"}
         "207": {$ref: "#/components/responses/Results"}
         "400": {$ref: "#/components/responses/Error"}
-        "403": {$ref: "#/components/responses/PermissionRequired"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "500": {$ref: "#/components/responses/InternalError"}
         "502": {$ref: "#/components/responses/Results"}
 
   /records/set:
@@ -128,7 +140,8 @@ paths:
         "200": {$ref: "#/components/responses/Results"}
         "207": {$ref: "#/components/responses/Results"}
         "400": {$ref: "#/components/responses/Error"}
-        "403": {$ref: "#/components/responses/PermissionRequired"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "500": {$ref: "#/components/responses/InternalError"}
         "502": {$ref: "#/components/responses/Results"}
 
   /records/append:
@@ -139,15 +152,18 @@ paths:
         "200": {$ref: "#/components/responses/Results"}
         "207": {$ref: "#/components/responses/Results"}
         "400": {$ref: "#/components/responses/Error"}
-        "403": {$ref: "#/components/responses/PermissionRequired"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "500": {$ref: "#/components/responses/InternalError"}
         "502": {$ref: "#/components/responses/Results"}
 
   /records/delete:
     post:
       summary: Delete records, or clear a whole RRset
       description: |
-        A record given **with** `data` deletes only that exact record. A record given **without**
-        `data` clears the whole `(name, type)` RRset, removing whatever it currently holds.
+        A record given **with** nonblank `data` deletes the record matching `(name, type, data)`.
+        `ttl` never participates in exact matching because DNS stores one TTL for the whole RRset,
+        not one per value. A record given **without** `data` clears the whole `(name, type)` RRset,
+        removing whatever it currently holds. Explicitly blank or null `data` is invalid.
 
         The second form is what an unconditional cleanup path needs: a process that died before
         recording the value it wrote cannot delete by exact value. Clearing a name that holds nothing
@@ -161,7 +177,8 @@ paths:
         "200": {$ref: "#/components/responses/Results"}
         "207": {$ref: "#/components/responses/Results"}
         "400": {$ref: "#/components/responses/Error"}
-        "403": {$ref: "#/components/responses/PermissionRequired"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "500": {$ref: "#/components/responses/InternalError"}
         "502": {$ref: "#/components/responses/Results"}
 
 components:
@@ -172,6 +189,7 @@ components:
         application/json:
           schema:
             type: object
+            additionalProperties: false
             required: [zone, records]
             properties:
               zone:
@@ -187,7 +205,7 @@ components:
               summary: Delete one specific record
               value:
                 zone: example.com
-                records: [{name: _acme-challenge, type: TXT, ttl: 60, data: "the-token"}]
+                records: [{name: _acme-challenge, type: TXT, data: "the-token"}]
             clearRRset:
               summary: Clear the whole RRset, whatever it holds
               value:
@@ -200,6 +218,7 @@ components:
         application/json:
           schema:
             type: object
+            additionalProperties: false
             required: [zone, records]
             properties:
               zone:
@@ -209,7 +228,7 @@ components:
               records:
                 type: array
                 minItems: 1
-                items: {$ref: "#/components/schemas/Record"}
+                items: {$ref: "#/components/schemas/WriteRecord"}
 
   responses:
     Results:
@@ -235,7 +254,7 @@ components:
                     ok: {type: boolean}
                     records:
                       type: array
-                      items: {$ref: "#/components/schemas/Record"}
+                      items: {$ref: "#/components/schemas/ReadRecord"}
                     error: {type: string}
 
     Error:
@@ -246,30 +265,28 @@ components:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
 
-    PermissionRequired:
+    Forbidden:
       description: |
-        The caller has no grant covering a record it tried to touch. `required_grant` describes the
-        grant that would permit it; because the scope is `global`, the router rewrites this response
-        to add a `grant_url` the consumer can send the owner to.
+        Either the caller has no grant covering a record it tried to touch, or the route was reached
+        without a service consumer identity. A `permission_required` response includes the grant that
+        would permit the operation; `not_a_service_call` does not include `required_grant`.
       content:
         application/json:
           schema:
-            type: object
-            required: [error, required_grant]
-            properties:
-              error:
-                type: string
-                enum: [permission_required, not_a_service_call]
-              message: {type: string}
-              required_grant:
-                type: object
-                properties:
-                  grant: {$ref: "#/components/schemas/Grant"}
-                  scope: {type: string, enum: [global]}
+            oneOf:
+              - {$ref: "#/components/schemas/PermissionRequiredError"}
+              - {$ref: "#/components/schemas/NotAServiceCallError"}
+
+    InternalError:
+      description: An unexpected storage or configuration lookup failed.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/InternalError"}
 
   schemas:
-    Record:
+    WriteRecord:
       type: object
+      additionalProperties: false
       required: [name, type, ttl, data]
       properties:
         name:
@@ -285,15 +302,38 @@ components:
           example: 300
         data:
           type: string
+          pattern: '\S'
           description: Unescaped zone-file RDATA.
           example: 192.0.2.1
 
+    ReadRecord:
+      type: object
+      required: [name, type, ttl, data]
+      properties:
+        name:
+          type: string
+          description: Zone-relative name; `@` for the apex.
+          example: www
+        type:
+          type: string
+          description: |
+            Any RR type returned by the provider, including types this service cannot write.
+          example: SOA
+        ttl:
+          type: integer
+          description: Seconds.
+          example: 300
+        data:
+          type: string
+          description: Unescaped zone-file RDATA.
+
     DeleteTarget:
       type: object
+      additionalProperties: false
       required: [name, type]
       description: |
-        A record to remove. With `data`, only that exact record is deleted. Without it, the whole
-        `(name, type)` RRset is cleared and `ttl` is ignored.
+        A record to remove. With nonblank `data`, the record matching `(name, type, data)` is deleted.
+        Without `data`, the whole `(name, type)` RRset is cleared. `ttl` is ignored in both forms.
       properties:
         name:
           type: string
@@ -304,10 +344,42 @@ components:
           enum: [A, AAAA, CAA, CNAME, MX, NS, SRV, TXT]
         ttl:
           type: integer
-          description: Seconds. Ignored when `data` is omitted.
+          description: Accepted for record-shape compatibility but ignored for deletion.
         data:
           type: string
-          description: Omit to clear the whole RRset.
+          pattern: '\S'
+          description: Omit to clear the whole RRset. Blank and null values are invalid.
+
+    PermissionRequiredError:
+      type: object
+      required: [error, message, required_grant]
+      properties:
+        error: {type: string, enum: [permission_required]}
+        message: {type: string}
+        required_grant:
+          type: object
+          required: [grant, scope]
+          properties:
+            grant: {$ref: "#/components/schemas/Grant"}
+            scope: {type: string, enum: [global]}
+            grant_url:
+              type: string
+              format: uri
+              description: Owner approval URL added by the OpenHost router when it proxies the response.
+
+    NotAServiceCallError:
+      type: object
+      required: [error, message]
+      properties:
+        error: {type: string, enum: [not_a_service_call]}
+        message: {type: string}
+
+    InternalError:
+      type: object
+      required: [error, message]
+      properties:
+        error: {type: string, enum: [internal_error]}
+        message: {type: string}
 
     Grant:
       type: object

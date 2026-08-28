@@ -97,13 +97,15 @@ func (s *Server) handleRecordDelete(w http.ResponseWriter, r *http.Request) {
 		redirectErr(w, r, dest, err)
 		return
 	}
-	s.store.Audit("owner", "", "delete", zone.Zone, rec.RR(), nil)
 	if len(deleted) == 0 {
 		// libdns silently ignores a delete that matches nothing; saying so beats a success message
 		// for an operation that did not happen.
-		redirectErr(w, r, dest, errors.New("no matching record was found, so nothing was deleted"))
+		err := errors.New("no matching record was found, so nothing was deleted")
+		s.store.Audit("owner", "", "delete", zone.Zone, rec.RR(), err)
+		redirectErr(w, r, dest, err)
 		return
 	}
+	s.store.Audit("owner", "", "delete", zone.Zone, rec.RR(), nil)
 	redirectOK(w, r, dest, "Deleted "+rec.RR().Name+" "+rec.RR().Type)
 }
 

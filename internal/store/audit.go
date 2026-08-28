@@ -6,6 +6,9 @@ import (
 	"time"
 )
 
+// auditRetentionLimit bounds persistent mutation history while retaining enough context for diagnosis.
+const auditRetentionLimit = 10_000
+
 // AuditEntry records who changed what. Anything that can repoint a domain is worth a trail: when
 // mail stops arriving, the first question is which app touched the MX record and when.
 type AuditEntry struct {
@@ -21,6 +24,22 @@ type AuditEntry struct {
 }
 
 func (s *Store) Audit(actor, actorAppID, op, zone string, detail any, opErr error) {
+	if err := s.writeAudit(actor, actorAppID, op, zone, detail, opErr, auditRetentionLimit); err != nil {
+		// A failure to write the audit trail must not fail the operation the user asked for, but it
+		// should be visible in the container logs rather than swallowed.
+		fmt.Printf("audit write failed for %s/%s: %v\n", actor, op, err)
+	}
+}
+
+func (s *Store) writeAudit(
+	actor, actorAppID, op, zone string,
+	detail any,
+	opErr error,
+	retentionLimit int,
+) error {
+	if retentionLimit <= 0 {
+		return fmt.Errorf("audit retention limit must be positive")
+	}
 	encoded := ""
 	if detail != nil {
 		if b, err := json.Marshal(detail); err == nil {
@@ -31,15 +50,30 @@ func (s *Store) Audit(actor, actorAppID, op, zone string, detail any, opErr erro
 	if opErr != nil {
 		errText = opErr.Error()
 	}
-	// A failure to write the audit trail must not fail the operation the user asked for, but it
-	// should be visible in the container logs rather than swallowed.
-	if _, err := s.db.Exec(
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin audit write: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
 		`INSERT INTO audit_log (ts, actor, actor_app_id, op, zone, detail, ok, error)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		time.Now().UTC().Format(time.RFC3339), actor, actorAppID, op, zone, encoded, opErr == nil, errText,
 	); err != nil {
-		fmt.Printf("audit write failed for %s/%s: %v\n", actor, op, err)
+		return fmt.Errorf("insert audit entry: %w", err)
 	}
+	if _, err := tx.Exec(
+		`DELETE FROM audit_log
+		 WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT ?)`,
+		retentionLimit,
+	); err != nil {
+		return fmt.Errorf("prune audit entries: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit audit write: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) AuditEntries(limit int) ([]AuditEntry, error) {
@@ -57,7 +91,9 @@ func (s *Store) AuditEntries(limit int) ([]AuditEntry, error) {
 			e  AuditEntry
 			ts string
 		)
-		if err := rows.Scan(&e.ID, &ts, &e.Actor, &e.ActorAppID, &e.Op, &e.Zone, &e.Detail, &e.OK, &e.Error); err != nil {
+		if err := rows.Scan(
+			&e.ID, &ts, &e.Actor, &e.ActorAppID, &e.Op, &e.Zone, &e.Detail, &e.OK, &e.Error,
+		); err != nil {
 			return nil, err
 		}
 		e.TS, _ = time.Parse(time.RFC3339, ts)

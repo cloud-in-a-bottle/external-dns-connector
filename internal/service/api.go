@@ -28,7 +28,7 @@ func New(s *store.Store, ops *dnsops.Ops) *API {
 
 // Handler mounts the service routes. Everything here is reachable only through the router's service
 // proxy: requireConsumer rejects anything without a router-injected consumer identity, which is what
-// keeps owner-only configuration (zones, credentials) outside any grant's reach.
+// keeps provider credentials and zone-binding mutations outside any grant's reach.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("POST /zones", a.requireConsumer(a.handleZones))

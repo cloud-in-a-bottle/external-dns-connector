@@ -89,7 +89,77 @@ func globalGrant(name, rrtype, access string) string {
 	return string(b)
 }
 
-const acmeGrant = `[{"grant":{"name":"_acme-challenge.**","type":"TXT","access":"rw"},"scope":"global"}]`
+const acmeGrant = `[
+  {"grant":{"name":"_acme-challenge","type":"TXT","access":"rw"},"scope":"global"},
+  {"grant":{"name":"_acme-challenge.**","type":"TXT","access":"rw"},"scope":"global"}
+]`
+
+func TestWriteResultsStatuses(t *testing.T) {
+	tests := []struct {
+		name    string
+		results []dnsops.ZoneResult
+		status  int
+		ok      bool
+	}{
+		{
+			name: "all zones succeeded",
+			results: []dnsops.ZoneResult{
+				{Zone: zoneA, OK: true},
+				{Zone: zoneB, OK: true},
+			},
+			status: http.StatusOK,
+			ok:     true,
+		},
+		{
+			name: "some zones succeeded",
+			results: []dnsops.ZoneResult{
+				{Zone: zoneA, OK: true},
+				{Zone: zoneB, Error: "provider failed"},
+			},
+			status: http.StatusMultiStatus,
+		},
+		{
+			name: "no zones succeeded",
+			results: []dnsops.ZoneResult{
+				{Zone: zoneA, Error: "provider failed"},
+				{Zone: zoneB, Error: "provider failed"},
+			},
+			status: http.StatusBadGateway,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			writeResults(recorder, tt.results)
+			if recorder.Code != tt.status {
+				t.Fatalf("status = %d, want %d", recorder.Code, tt.status)
+			}
+			var response resultsResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if response.OK != tt.ok {
+				t.Fatalf("ok = %v, want %v", response.OK, tt.ok)
+			}
+		})
+	}
+}
+
+func TestGetRequiresBodyAndAcceptsEmptyObject(t *testing.T) {
+	handler := newTestAPI(t)
+	permissions := globalGrant("**", "**", "r")
+
+	code, _, raw := call(t, handler, "/records/get", nil, permissions)
+	if code != http.StatusBadRequest || raw["error"] != "invalid_request" {
+		t.Fatalf("missing body returned %d %v, want 400 invalid_request", code, raw)
+	}
+
+	code, results, raw := call(t, handler, "/records/get", struct{}{}, permissions)
+	if code != http.StatusOK || !results.OK {
+		t.Fatalf("empty object returned %d %v, want 200 results", code, raw)
+	}
+}
 
 func TestWriteAndReadBackWithinGrant(t *testing.T) {
 	h := newTestAPI(t)

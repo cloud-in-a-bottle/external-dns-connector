@@ -41,8 +41,8 @@ func New(s *store.Store, ops *dnsops.Ops) (*Server, error) {
 }
 
 // Handler mounts the owner-facing UI. Every route here requires the owner and explicitly rejects a
-// consumer identity, which is what keeps zone and credential configuration out of reach of any
-// permission grant — there is simply no service route that touches it.
+// consumer identity, which is what keeps provider credentials and zone-binding mutations out of
+// reach of any permission grant. Service consumers can list zone names but cannot change bindings.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /{$}", s.ownerOnly(s.handleZones))

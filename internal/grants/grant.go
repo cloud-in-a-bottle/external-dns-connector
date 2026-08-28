@@ -16,7 +16,8 @@ const (
 )
 
 // Grant is one permission entry as it appears in a consumer app's manifest. Zones are deliberately
-// absent: which zones exist is owner-only configuration that no consumer can see or influence.
+// absent: a grant applies to matching records in every configured zone. Only the owner can change
+// zone bindings, while any consumer with a valid nonempty grant can list configured zone names.
 type Grant struct {
 	Name   string `json:"name"`
 	Type   string `json:"type"`

@@ -11,9 +11,9 @@
 - `internal/auth` classifies every request from the headers the router injects. a request carrying
   `X-OpenHost-Consumer-Id` is a service call; `X-OpenHost-Is-Owner: true` without one is the owner.
 - owner routes (`internal/web`) reject anything with a consumer identity. service routes
-  (`internal/service`) reject anything without one. zone and credential configuration exists only on
-  the owner side, which is what makes it unreachable by any permission grant — there is no service
-  route that touches it.
+  (`internal/service`) reject anything without one. provider credentials and zone binding mutations
+  exist only on the owner side, so no permission grant can reach them. the service `/zones` route does
+  expose configured zone names to a consumer with at least one valid, nonempty DNS grant.
 - this rests on the router being the sole authority for `X-OpenHost-*` headers. it is:
   `_sanitize_forwarded_headers` in `compute_space/src/compute_space/web/helpers/proxy.py` strips all
   inbound ones before adding its own, and app ports are published on host loopback only. the
