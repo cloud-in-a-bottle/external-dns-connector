@@ -32,18 +32,18 @@ func TestProviderSelectorShowsOnlyProductionProviders(t *testing.T) {
 	}
 
 	body := rec.Body.String()
-	if got := strings.Count(body, `<option value="`); got != 2 {
-		t.Fatalf("expected exactly two provider options, got %d: %s", got, body)
+	if got := strings.Count(body, `<option value="`); got != 1 {
+		t.Fatalf("expected exactly one provider option, got %d: %s", got, body)
 	}
-	for _, key := range []string{"route53", "hetzner"} {
-		if !strings.Contains(body, `<option value="`+key+`"`) {
-			t.Errorf("provider selector is missing %q", key)
+	if !strings.Contains(body, `<option value="hetzner"`) {
+		t.Error("provider selector is missing Hetzner")
+	}
+	for _, hidden := range []string{"mock", "route53"} {
+		if strings.Contains(body, `value="`+hidden+`"`) {
+			t.Errorf("unsupported provider %q appeared in the owner provider form", hidden)
 		}
 	}
-	if strings.Contains(body, `value="mock"`) {
-		t.Error("mock provider appeared in the owner provider form")
-	}
-	if !strings.Contains(body, `<input type="hidden" name="provider" value="route53">`) {
+	if !strings.Contains(body, `<input type="hidden" name="provider" value="hetzner">`) {
 		t.Error("provider=mock selected the hidden mock instead of the default production provider")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/libdns/libdns"
 
@@ -19,8 +20,7 @@ type rrsetKey struct {
 
 type rrsetPlan struct {
 	key     rrsetKey
-	current []libdns.Record
-	desired []libdns.Record
+	records []libdns.Record
 	result  []libdns.Record
 	changed bool
 }
@@ -47,46 +47,55 @@ func applySemanticMutation(
 		return nil, err
 	}
 
-	var (
-		setter  libdns.RecordSetter
-		deleter libdns.RecordDeleter
-	)
+	hasChanges := false
 	for _, plan := range plans {
-		if !plan.changed {
-			continue
+		if plan.changed {
+			hasChanges = true
+			break
 		}
-		if len(plan.desired) > 0 && setter == nil {
-			var ok bool
+	}
+
+	var (
+		appender libdns.RecordAppender
+		setter   libdns.RecordSetter
+		deleter  libdns.RecordDeleter
+	)
+	if hasChanges {
+		var ok bool
+		switch op {
+		case OpSet:
 			setter, ok = p.(libdns.RecordSetter)
-			if !ok {
-				return nil, fmt.Errorf("provider %s cannot set records", z.Provider)
-			}
-		}
-		if len(plan.desired) == 0 && deleter == nil {
-			var ok bool
+		case OpAppend:
+			appender, ok = p.(libdns.RecordAppender)
+		case OpDelete:
 			deleter, ok = p.(libdns.RecordDeleter)
-			if !ok {
-				return nil, fmt.Errorf("provider %s cannot delete records", z.Provider)
-			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("provider %s cannot %s records", z.Provider, op)
 		}
 	}
 
 	fqdn := z.Zone + "."
-	var result []libdns.Record
 	for _, plan := range plans {
 		if !plan.changed {
 			continue
 		}
-		if len(plan.desired) > 0 {
-			if _, err := setter.SetRecords(ctx, fqdn, plan.desired); err != nil {
-				return nil, fmt.Errorf("%s RRset %s/%s: %w", op, plan.key.name, plan.key.rrtype, err)
-			}
-		} else {
-			// The fresh records, not the provider's return slice, define what this operation deleted.
-			if _, err := deleter.DeleteRecords(ctx, fqdn, plan.current); err != nil {
-				return nil, fmt.Errorf("delete RRset %s/%s: %w", plan.key.name, plan.key.rrtype, err)
-			}
+		var err error
+		switch op {
+		case OpSet:
+			_, err = setter.SetRecords(ctx, fqdn, plan.records)
+		case OpAppend:
+			_, err = appender.AppendRecords(ctx, fqdn, plan.records)
+		case OpDelete:
+			_, err = deleter.DeleteRecords(ctx, fqdn, plan.records)
 		}
+		if err != nil {
+			return nil, fmt.Errorf("%s RRset %s/%s: %w", op, plan.key.name, plan.key.rrtype, err)
+		}
+	}
+
+	var result []libdns.Record
+	for _, plan := range plans {
 		result = append(result, plan.result...)
 	}
 	return result, nil
@@ -139,16 +148,16 @@ func planRRsets(
 	for _, key := range keys {
 		currentSet := currentByKey[key]
 		requestSet := requestedByKey[key]
-		plan := rrsetPlan{key: key, current: currentSet}
+		plan := rrsetPlan{key: key}
 
 		switch op {
 		case OpSet:
 			if err := requireSharedTTL(key, requestSet); err != nil {
 				return nil, err
 			}
-			plan.desired = uniqueValues(requestSet)
-			plan.result = plan.desired
-			plan.changed = true
+			plan.records = uniqueValues(requestSet)
+			plan.result = copyRecords(plan.records)
+			plan.changed = !sameRRset(currentSet, plan.records)
 
 		case OpAppend:
 			withRequests := append(copyRecords(currentSet), requestSet...)
@@ -156,33 +165,30 @@ func planRRsets(
 				return nil, err
 			}
 			uniqueRequests := uniqueValues(requestSet)
-			plan.desired = copyRecords(currentSet)
 			seen := recordValues(currentSet)
 			for _, rec := range uniqueRequests {
 				if seen[rec.RR().Data] {
 					continue
 				}
 				seen[rec.RR().Data] = true
-				plan.desired = append(plan.desired, rec)
-				plan.result = append(plan.result, rec)
+				plan.records = append(plan.records, rec)
 			}
-			plan.changed = len(plan.result) > 0
+			plan.result = copyRecords(plan.records)
+			plan.changed = len(plan.records) > 0
 
 		case OpDelete:
 			if clearByKey[key] {
-				plan.result = copyRecords(currentSet)
-				plan.changed = len(currentSet) > 0
-				break
-			}
-			targets := recordValues(uniqueValues(requestSet))
-			for _, rec := range currentSet {
-				if targets[rec.RR().Data] {
-					plan.result = append(plan.result, rec)
-				} else {
-					plan.desired = append(plan.desired, rec)
+				plan.records = copyRecords(currentSet)
+			} else {
+				targets := recordValues(uniqueValues(requestSet))
+				for _, rec := range currentSet {
+					if targets[rec.RR().Data] {
+						plan.records = append(plan.records, rec)
+					}
 				}
 			}
-			plan.changed = len(plan.result) > 0
+			plan.result = copyRecords(plan.records)
+			plan.changed = len(plan.records) > 0
 		}
 		plans = append(plans, plan)
 	}
@@ -225,6 +231,31 @@ func recordValues(recs []libdns.Record) map[string]bool {
 		values[rec.RR().Data] = true
 	}
 	return values
+}
+
+type rrsetMember struct {
+	data string
+	ttl  time.Duration
+}
+
+func sameRRset(left, right []libdns.Record) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	members := make(map[rrsetMember]int, len(left))
+	for _, rec := range left {
+		rr := rec.RR()
+		members[rrsetMember{data: rr.Data, ttl: rr.TTL}]++
+	}
+	for _, rec := range right {
+		rr := rec.RR()
+		member := rrsetMember{data: rr.Data, ttl: rr.TTL}
+		if members[member] == 0 {
+			return false
+		}
+		members[member]--
+	}
+	return true
 }
 
 func requireSharedTTL(key rrsetKey, recs []libdns.Record) error {

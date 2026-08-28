@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 
 	"github.com/libdns/hetzner/v2"
-	"github.com/libdns/route53"
 )
 
 // unmarshalInto builds the New function for a provider whose credentials are just the JSON form of
@@ -25,29 +24,7 @@ func secret(key, label, help string) Field {
 	return Field{Key: key, Label: label, Required: true, Secret: true, Help: help}
 }
 
-func public(key, label, help string) Field {
-	return Field{Key: key, Label: label, Secret: false, Help: help}
-}
-
 func init() {
-	register(Entry{
-		Key: "route53", Label: "AWS Route 53",
-		DocURL: "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/" +
-			"access-control-managing-permissions.html",
-		SourceURL: "https://github.com/libdns/route53/blob/840c6120709b2f9da6d74dc5d562e2625334aecc/provider.go",
-		Fields: []Field{
-			secret("access_key_id", "Access key ID", ""),
-			secret("secret_access_key", "Secret access key", ""),
-			public("region", "Region", "Defaults to the AWS_REGION environment variable if blank."),
-			Field{
-				Key: "session_token", Label: "Session token", Secret: true,
-				Help: "Only for temporary STS credentials.",
-			},
-			public("hosted_zone_id", "Hosted zone ID", "Optional; pins operations to one hosted zone."),
-		},
-		New: unmarshalInto[route53.Provider](),
-	})
-
 	register(Entry{
 		Key: "hetzner", Label: "Hetzner",
 		DocURL:    "https://docs.hetzner.cloud/#getting-started",

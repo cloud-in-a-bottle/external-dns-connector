@@ -46,36 +46,25 @@ func TestFieldKeysReachTheProviderStruct(t *testing.T) {
 func sentinel(i int) string { return "sentinel-value-" + string(rune('a'+i)) }
 
 func TestProductionProvidersArePinnedAndImplementSemanticInterfaces(t *testing.T) {
-	want := map[string]string{
-		"route53": "https://github.com/libdns/route53/blob/" +
-			"840c6120709b2f9da6d74dc5d562e2625334aecc/provider.go",
-		"hetzner": "https://github.com/libdns/hetzner/blob/" +
-			"36dd896cea1474c0cbb7a6a9bf6dbc0f14a0c178/provider.go",
+	providers := All()
+	if len(providers) != 1 {
+		t.Fatalf("expected Hetzner to be the only production provider, got %+v", providers)
 	}
-	if got := len(All()); got != len(want) {
-		t.Fatalf("expected exactly %d production providers, got %d", len(want), got)
+	e := providers[0]
+	if e.Key != "hetzner" {
+		t.Fatalf("production provider = %q, want hetzner", e.Key)
 	}
-
-	for _, e := range All() {
-		source, ok := want[e.Key]
-		if !ok {
-			t.Errorf("unexpected production provider %q", e.Key)
-			continue
-		}
-		delete(want, e.Key)
-		if e.SourceURL != source {
-			t.Errorf("%s: source URL = %q, want exact pinned source %q", e.Key, e.SourceURL, source)
-		}
-		p, err := e.New(Deps{}, nil)
-		if err != nil {
-			t.Fatalf("%s: New(nil) errored: %v", e.Key, err)
-		}
-		if c := CapabilitiesOf(p); !c.Get || !c.Set || !c.Delete {
-			t.Errorf("%s: missing an interface required by semantic mutations: %+v", e.Key, c)
-		}
+	wantSource := "https://github.com/libdns/hetzner/blob/" +
+		"36dd896cea1474c0cbb7a6a9bf6dbc0f14a0c178/provider.go"
+	if e.SourceURL != wantSource {
+		t.Errorf("source URL = %q, want exact pinned source %q", e.SourceURL, wantSource)
 	}
-	for key := range want {
-		t.Errorf("production provider %q is not registered", key)
+	p, err := e.New(Deps{}, nil)
+	if err != nil {
+		t.Fatalf("New(nil): %v", err)
+	}
+	if c := CapabilitiesOf(p); !c.Get || !c.Append || !c.Set || !c.Delete {
+		t.Errorf("Hetzner is missing an interface required by semantic mutations: %+v", c)
 	}
 }
 
@@ -96,7 +85,7 @@ func TestMockIsLookupableButHidden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build mock: %v", err)
 	}
-	if c := CapabilitiesOf(p); !c.Get || !c.Set || !c.Delete {
+	if c := CapabilitiesOf(p); !c.Get || !c.Append || !c.Set || !c.Delete {
 		t.Errorf("mock is missing an interface required by semantic mutations: %+v", c)
 	}
 }
@@ -141,23 +130,25 @@ func TestCredentialsFromFormKeepsExistingSecretWhenBlank(t *testing.T) {
 }
 
 func TestRedactedHidesSecretsButNotPublicFields(t *testing.T) {
-	e, err := Lookup("route53")
-	if err != nil {
-		t.Fatal(err)
-	}
+	e := Entry{Fields: []Field{
+		{Key: "token", Secret: true},
+		{Key: "region"},
+	}}
 	got := e.Redacted(json.RawMessage(
-		`{"access_key_id":"AKID","secret_access_key":"SEC","region":"us-east-1"}`,
+		`{"token":"SEC","region":"eu-central"}`,
 	))
-	if strings.Contains(got["secret_access_key"], "SEC") || strings.Contains(got["access_key_id"], "AKID") {
+	if strings.Contains(got["token"], "SEC") {
 		t.Errorf("secrets leaked into the redacted view: %v", got)
 	}
-	if got["region"] != "us-east-1" {
+	if got["region"] != "eu-central" {
 		t.Errorf("public field should survive redaction, got %q", got["region"])
 	}
 }
 
 func TestLookupRejectsUnknownProvider(t *testing.T) {
-	if _, err := Lookup("not-a-provider"); err == nil {
-		t.Error("Lookup should reject an unknown provider key")
+	for _, key := range []string{"route53", "not-a-provider"} {
+		if _, err := Lookup(key); err == nil {
+			t.Errorf("Lookup should reject unsupported provider %q", key)
+		}
 	}
 }
