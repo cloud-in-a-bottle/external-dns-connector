@@ -124,15 +124,7 @@ func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 		redirectErr(w, r, "/accounts", err)
 		return
 	}
-	// Zones cascade away with the account, so drop their cached reads first.
-	if zones, err := s.store.Zones(); err == nil {
-		for _, z := range zones {
-			if z.AccountID == id {
-				s.ops.InvalidateZone(z.Zone)
-			}
-		}
-	}
-	if err := s.store.DeleteAccount(id); err != nil {
+	if err := s.ops.DeleteAccount(r.Context(), id); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			redirectErr(w, r, "/accounts", errors.New("that account no longer exists"))
 			return

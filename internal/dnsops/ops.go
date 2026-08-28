@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -25,6 +26,49 @@ var ErrUnknownZone = errors.New("unknown zone")
 // consumer polling records would exhaust that budget on its own.
 const cacheTTL = 30 * time.Second
 
+// The router normally allows 30 seconds for a service response. Keeping provider work below that
+// leaves time to serialize and return a useful error before the connection is closed.
+const defaultProviderTimeout = 20 * time.Second
+
+type contextLock struct {
+	token chan struct{}
+}
+
+func newContextLock() *contextLock {
+	l := &contextLock{token: make(chan struct{}, 1)}
+	l.token <- struct{}{}
+	return l
+}
+
+func (l *contextLock) lock(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-l.token:
+		select {
+		case <-ctx.Done():
+			l.unlock()
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+}
+
+func (l *contextLock) unlock() {
+	l.token <- struct{}{}
+}
+
+type cacheKey struct {
+	zone      string
+	accountID int64
+}
+
 type cacheEntry struct {
 	records []libdns.Record
 	fetched time.Time
@@ -32,23 +76,47 @@ type cacheEntry struct {
 
 // Ops runs record operations against the configured providers.
 type Ops struct {
-	store *store.Store
-	deps  dnsprov.Deps
+	store         *store.Store
+	buildProvider func(store.Account) (any, error)
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
-	cache map[string]cacheEntry
-	nowFn func() time.Time
+	configMu sync.Mutex
+	locksMu  sync.Mutex
+	locks    map[string]*contextLock
+	cacheMu  sync.Mutex
+	cache    map[cacheKey]cacheEntry
+	nowFn    func() time.Time
+	timeout  time.Duration
 }
 
-func New(s *store.Store) *Ops {
-	return &Ops{
-		store: s,
-		deps:  dnsprov.Deps{DB: s.DB()},
-		locks: map[string]*sync.Mutex{},
-		cache: map[string]cacheEntry{},
-		nowFn: time.Now,
+// Option configures Ops.
+type Option func(*Ops)
+
+// WithProviderTimeout overrides the deadline applied to each provider operation.
+func WithProviderTimeout(timeout time.Duration) Option {
+	if timeout <= 0 {
+		panic("provider timeout must be positive")
 	}
+	return func(o *Ops) {
+		o.timeout = timeout
+	}
+}
+
+func New(s *store.Store, options ...Option) *Ops {
+	deps := dnsprov.Deps{DB: s.DB()}
+	o := &Ops{
+		store: s,
+		buildProvider: func(acct store.Account) (any, error) {
+			return dnsprov.Build(deps, acct.Provider, acct.Credentials)
+		},
+		locks:   map[string]*contextLock{},
+		cache:   map[cacheKey]cacheEntry{},
+		nowFn:   time.Now,
+		timeout: defaultProviderTimeout,
+	}
+	for _, option := range options {
+		option(o)
+	}
+	return o
 }
 
 // ZoneResult is the outcome of one operation against one zone. Fan-out reports per zone rather than
@@ -88,66 +156,214 @@ func (o *Ops) provider(z store.Zone) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return dnsprov.Build(o.deps, acct.Provider, acct.Credentials)
+	return o.buildProvider(acct)
 }
 
-func (o *Ops) zoneLock(zone string) *sync.Mutex {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+func (o *Ops) zoneLock(zone string) *contextLock {
+	o.locksMu.Lock()
+	defer o.locksMu.Unlock()
 	if l, ok := o.locks[zone]; ok {
 		return l
 	}
-	l := &sync.Mutex{}
+	l := newContextLock()
 	o.locks[zone] = l
 	return l
 }
 
-func (o *Ops) cached(zone string) ([]libdns.Record, bool) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	e, ok := o.cache[zone]
+// cached is called only while the corresponding zone lock is held. accountID keeps a stale entry
+// from one binding from being reused if the zone is rebound before invalidation.
+func (o *Ops) cached(z store.Zone) ([]libdns.Record, bool) {
+	o.cacheMu.Lock()
+	defer o.cacheMu.Unlock()
+	e, ok := o.cache[cacheKey{zone: z.Zone, accountID: z.AccountID}]
 	if !ok || o.nowFn().Sub(e.fetched) > cacheTTL {
 		return nil, false
 	}
 	return e.records, true
 }
 
-func (o *Ops) putCache(zone string, recs []libdns.Record) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.cache[zone] = cacheEntry{records: recs, fetched: o.nowFn()}
+func (o *Ops) putCache(z store.Zone, recs []libdns.Record) {
+	o.cacheMu.Lock()
+	defer o.cacheMu.Unlock()
+	o.cache[cacheKey{zone: z.Zone, accountID: z.AccountID}] = cacheEntry{
+		records: recs,
+		fetched: o.nowFn(),
+	}
 }
 
-// InvalidateZone drops the cached read for a zone. Called after every write, including writes made
-// through the owner UI, so a subsequent read never reports the pre-write state.
-func (o *Ops) InvalidateZone(zone string) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	delete(o.cache, zone)
+func (o *Ops) invalidateZone(zone string) {
+	o.cacheMu.Lock()
+	defer o.cacheMu.Unlock()
+	for key := range o.cache {
+		if key.zone == zone {
+			delete(o.cache, key)
+		}
+	}
+}
+
+func (o *Ops) lockZones(ctx context.Context, zones []string) (func(), error) {
+	seen := make(map[string]bool, len(zones))
+	names := make([]string, 0, len(zones))
+	for _, zone := range zones {
+		zone = records.NormalizeZone(zone)
+		if seen[zone] {
+			continue
+		}
+		seen[zone] = true
+		names = append(names, zone)
+	}
+	sort.Strings(names)
+
+	held := make([]*contextLock, 0, len(names))
+	for _, name := range names {
+		lock := o.zoneLock(name)
+		if err := lock.lock(ctx); err != nil {
+			for i := len(held) - 1; i >= 0; i-- {
+				held[i].unlock()
+			}
+			return nil, err
+		}
+		held = append(held, lock)
+	}
+	return func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].unlock()
+		}
+	}, nil
+}
+
+// AddZone serializes one owner binding change with provider work for that zone.
+func (o *Ops) AddZone(ctx context.Context, binding store.ZoneBinding) error {
+	zone := records.NormalizeZone(binding.Zone)
+	o.configMu.Lock()
+	defer o.configMu.Unlock()
+
+	unlock, err := o.lockZones(ctx, []string{zone})
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if _, err := o.store.Zone(zone); err == nil {
+		return fmt.Errorf("zone %s is already configured", zone)
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if err := o.store.AddZone(store.ZoneBinding{Zone: zone, AccountID: binding.AccountID}); err != nil {
+		return err
+	}
+	o.invalidateZone(zone)
+	return nil
+}
+
+// DeleteZone serializes one owner binding removal with provider work for that zone.
+func (o *Ops) DeleteZone(ctx context.Context, zone string) error {
+	zone = records.NormalizeZone(zone)
+	o.configMu.Lock()
+	defer o.configMu.Unlock()
+
+	unlock, err := o.lockZones(ctx, []string{zone})
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if err := o.store.DeleteZone(zone); err != nil {
+		return err
+	}
+	o.invalidateZone(zone)
+	return nil
+}
+
+// ReplaceZones serializes a whole owner binding-set replacement with every possibly affected zone.
+func (o *Ops) ReplaceZones(ctx context.Context, bindings []store.ZoneBinding) error {
+	o.configMu.Lock()
+	defer o.configMu.Unlock()
+
+	existing, err := o.store.Zones()
+	if err != nil {
+		return err
+	}
+	affected := make([]string, 0, len(existing)+len(bindings))
+	for _, zone := range existing {
+		affected = append(affected, zone.Zone)
+	}
+	for _, binding := range bindings {
+		affected = append(affected, binding.Zone)
+	}
+	unlock, err := o.lockZones(ctx, affected)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if err := o.store.ReplaceZones(bindings); err != nil {
+		return err
+	}
+	for _, zone := range affected {
+		o.invalidateZone(records.NormalizeZone(zone))
+	}
+	return nil
+}
+
+// DeleteAccount serializes its cascading zone removals with provider work for those zones.
+func (o *Ops) DeleteAccount(ctx context.Context, id int64) error {
+	o.configMu.Lock()
+	defer o.configMu.Unlock()
+
+	zones, err := o.store.Zones()
+	if err != nil {
+		return err
+	}
+	var affected []string
+	for _, zone := range zones {
+		if zone.AccountID == id {
+			affected = append(affected, zone.Zone)
+		}
+	}
+	unlock, err := o.lockZones(ctx, affected)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	if err := o.store.DeleteAccount(id); err != nil {
+		return err
+	}
+	for _, zone := range affected {
+		o.invalidateZone(zone)
+	}
+	return nil
 }
 
 // Get returns every record in a zone, from cache when fresh.
 func (o *Ops) Get(ctx context.Context, z store.Zone) ([]libdns.Record, error) {
-	if recs, ok := o.cached(z.Zone); ok {
-		return recs, nil
+	zone := records.NormalizeZone(z.Zone)
+	lock := o.zoneLock(zone)
+	if err := lock.lock(ctx); err != nil {
+		return nil, err
 	}
-	lock := o.zoneLock(z.Zone)
-	lock.Lock()
-	defer lock.Unlock()
-	// Another caller may have populated the cache while we waited for the lock.
-	if recs, ok := o.cached(z.Zone); ok {
+	defer lock.unlock()
+
+	current, err := o.store.Zone(zone)
+	if err != nil {
+		return nil, err
+	}
+	if recs, ok := o.cached(current); ok {
 		return recs, nil
 	}
 
-	p, err := o.provider(z)
+	opCtx, cancel := context.WithTimeout(ctx, o.timeout)
+	defer cancel()
+	p, err := o.provider(current)
 	if err != nil {
 		return nil, err
 	}
-	recs, err := fetch(ctx, p, z)
+	recs, err := fetch(opCtx, p, current)
 	if err != nil {
 		return nil, err
 	}
-	o.putCache(z.Zone, recs)
+	o.putCache(current, recs)
 	return recs, nil
 }
 
@@ -187,22 +403,34 @@ func (o *Ops) Delete(
 func (o *Ops) mutate(
 	ctx context.Context, z store.Zone, op WriteOp, recs []libdns.Record, clears []records.RRset,
 ) ([]libdns.Record, error) {
-	lock := o.zoneLock(z.Zone)
-	lock.Lock()
-	defer lock.Unlock()
-	defer o.InvalidateZone(z.Zone)
+	zone := records.NormalizeZone(z.Zone)
+	lock := o.zoneLock(zone)
+	if err := lock.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer lock.unlock()
 
-	p, err := o.provider(z)
+	current, err := o.store.Zone(zone)
 	if err != nil {
 		return nil, err
 	}
-	return applySemanticMutation(ctx, p, z, op, recs, clears)
+	defer o.invalidateZone(zone)
+
+	opCtx, cancel := context.WithTimeout(ctx, o.timeout)
+	defer cancel()
+	p, err := o.provider(current)
+	if err != nil {
+		return nil, err
+	}
+	return applySemanticMutation(opCtx, p, current, op, recs, clears)
 }
 
 // ListProviderZones asks a provider which zones it can see, for the owner UI's zone picker. Not every
 // provider supports it; callers fall back to manual entry.
 func (o *Ops) ListProviderZones(ctx context.Context, acct store.Account) ([]string, error) {
-	p, err := dnsprov.Build(o.deps, acct.Provider, acct.Credentials)
+	opCtx, cancel := context.WithTimeout(ctx, o.timeout)
+	defer cancel()
+	p, err := o.buildProvider(acct)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +438,7 @@ func (o *Ops) ListProviderZones(ctx context.Context, acct store.Account) ([]stri
 	if !ok {
 		return nil, fmt.Errorf("provider %s cannot list zones", acct.Provider)
 	}
-	zones, err := lister.ListZones(ctx)
+	zones, err := lister.ListZones(opCtx)
 	if err != nil {
 		return nil, err
 	}

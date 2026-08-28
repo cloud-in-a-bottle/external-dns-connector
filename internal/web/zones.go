@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/records"
@@ -65,20 +64,7 @@ func (s *Server) handleZoneAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := s.store.Zones()
-	if err != nil {
-		redirectErr(w, r, "/", err)
-		return
-	}
-	bindings := toBindings(existing)
-	for _, b := range bindings {
-		if b.Zone == zone {
-			redirectErr(w, r, "/", fmt.Errorf("zone %s is already configured", zone))
-			return
-		}
-	}
-	bindings = append(bindings, store.ZoneBinding{Zone: zone, AccountID: accountID})
-	if err := s.store.ReplaceZones(bindings); err != nil {
+	if err := s.ops.AddZone(r.Context(), store.ZoneBinding{Zone: zone, AccountID: accountID}); err != nil {
 		redirectErr(w, r, "/", err)
 		return
 	}
@@ -88,22 +74,10 @@ func (s *Server) handleZoneAdd(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleZoneDelete(w http.ResponseWriter, r *http.Request) {
 	zone := records.NormalizeZone(r.FormValue("zone"))
-	existing, err := s.store.Zones()
-	if err != nil {
+	if err := s.ops.DeleteZone(r.Context(), zone); err != nil {
 		redirectErr(w, r, "/", err)
 		return
 	}
-	var kept []store.ZoneBinding
-	for _, b := range toBindings(existing) {
-		if b.Zone != zone {
-			kept = append(kept, b)
-		}
-	}
-	if err := s.store.ReplaceZones(kept); err != nil {
-		redirectErr(w, r, "/", err)
-		return
-	}
-	s.ops.InvalidateZone(zone)
 	s.store.Audit("owner", "", "zone_remove", zone, nil, nil)
 	redirectOK(w, r, "/", "Removed "+zone)
 }
@@ -141,12 +115,9 @@ func (s *Server) handleZonesReplace(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := s.store.ReplaceZones(req.Zones); err != nil {
+	if err := s.ops.ReplaceZones(r.Context(), req.Zones); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
-	}
-	for _, b := range req.Zones {
-		s.ops.InvalidateZone(records.NormalizeZone(b.Zone))
 	}
 	s.store.Audit("owner", "", "zones_replace", "", req.Zones, nil)
 
@@ -177,25 +148,25 @@ func (s *Server) discoverZones(
 	ctx, cancel := context.WithTimeout(ctx, zoneDiscoveryTimeout)
 	defer cancel()
 
-	var (
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-		found []string
-	)
+	results := make(chan zoneDiscoveryResult, len(accounts))
 	for _, a := range accounts {
-		wg.Add(1)
-		go func(a store.Account) {
-			defer wg.Done()
-			zones, err := s.ops.ListProviderZones(ctx, a)
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			found = append(found, zones...)
-		}(a)
+		go s.discoverAccountZones(ctx, a, results)
 	}
-	wg.Wait()
+
+	var found []string
+	remaining := len(accounts)
+collect:
+	for remaining > 0 {
+		select {
+		case result := <-results:
+			remaining--
+			if result.err == nil {
+				found = append(found, result.zones...)
+			}
+		case <-ctx.Done():
+			break collect
+		}
+	}
 
 	seen := map[string]bool{}
 	var out []string
@@ -209,10 +180,18 @@ func (s *Server) discoverZones(
 	return out
 }
 
-func toBindings(zones []store.Zone) []store.ZoneBinding {
-	out := make([]store.ZoneBinding, 0, len(zones))
-	for _, z := range zones {
-		out = append(out, store.ZoneBinding{Zone: z.Zone, AccountID: z.AccountID})
-	}
-	return out
+type zoneDiscoveryResult struct {
+	zones []string
+	err   error
+}
+
+func (s *Server) discoverAccountZones(
+	ctx context.Context,
+	account store.Account,
+	results chan<- zoneDiscoveryResult,
+) {
+	zones, err := s.listProviderZones(ctx, account)
+	// The channel has room for every worker, so a provider that ignores cancellation can finish late
+	// without blocking after the page has already returned.
+	results <- zoneDiscoveryResult{zones: zones, err: err}
 }

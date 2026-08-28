@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +23,8 @@ import (
 // serviceEndpoint must match the `endpoint` of the [[services.v2.provides]] entry in
 // cloudinabottle.toml — the router proxies service calls to this prefix.
 const serviceEndpoint = "/api/dns/"
+
+const shutdownTimeout = 10 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -58,24 +61,60 @@ func run() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           logRequests(mux),
 		ReadHeaderTimeout: 10 * time.Second,
-		// Provider APIs can be slow; the router's own proxy timeout bounds the client side.
+		// Provider operations have their own shorter deadline; this remains the final response bound.
 		WriteTimeout: 60 * time.Second,
 	}
 
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+	log.Printf("dns-connector listening on %s (app %s)", cfg.ListenAddr, cfg.AppName)
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serve(shutdownCtx, srv, shutdownTimeout)
+}
+
+type serverLifecycle interface {
+	ListenAndServe() error
+	Shutdown(context.Context) error
+	Close() error
+}
+
+func serve(ctx context.Context, srv serverLifecycle, timeout time.Duration) error {
+	serveErr := make(chan error, 1)
 	go func() {
-		<-shutdown
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(ctx)
+		serveErr <- srv.ListenAndServe()
 	}()
 
-	log.Printf("dns-connector listening on %s (app %s)", cfg.ListenAddr, cfg.AppName)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
 	}
-	return nil
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	shutdownErr := srv.Shutdown(drainCtx)
+	cancel()
+
+	var closeErr error
+	if shutdownErr != nil {
+		// Shutdown can time out while handlers are still active. Close releases the listener and those
+		// connections so the serving goroutine cannot outlive the store it may still use.
+		closeErr = srv.Close()
+	}
+	listenErr := <-serveErr
+
+	var errs []error
+	if shutdownErr != nil {
+		errs = append(errs, fmt.Errorf("shut down HTTP server: %w", shutdownErr))
+	}
+	if closeErr != nil {
+		errs = append(errs, fmt.Errorf("close HTTP server after failed shutdown: %w", closeErr))
+	}
+	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
+		errs = append(errs, listenErr)
+	}
+	return errors.Join(errs...)
 }
 
 func health(w http.ResponseWriter, _ *http.Request) {
@@ -104,6 +143,13 @@ func logRequests(next http.Handler) http.Handler {
 		if caller == "" {
 			caller = "-"
 		}
-		log.Printf("%s %s %d %s caller=%s", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond), caller)
+		log.Printf(
+			"%s %s %d %s caller=%s",
+			r.Method,
+			r.URL.Path,
+			rec.status,
+			time.Since(start).Round(time.Millisecond),
+			caller,
+		)
 	})
 }

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"html/template"
 	"net/http"
@@ -15,9 +16,10 @@ import (
 var templateFS embed.FS
 
 type Server struct {
-	store *store.Store
-	ops   *dnsops.Ops
-	tmpl  map[string]*template.Template
+	store             *store.Store
+	ops               *dnsops.Ops
+	tmpl              map[string]*template.Template
+	listProviderZones func(context.Context, store.Account) ([]string, error)
 }
 
 func New(s *store.Store, ops *dnsops.Ops) (*Server, error) {
@@ -30,7 +32,12 @@ func New(s *store.Store, ops *dnsops.Ops) (*Server, error) {
 		}
 		tmpl[name] = t
 	}
-	return &Server{store: s, ops: ops, tmpl: tmpl}, nil
+	return &Server{
+		store:             s,
+		ops:               ops,
+		tmpl:              tmpl,
+		listProviderZones: ops.ListProviderZones,
+	}, nil
 }
 
 // Handler mounts the owner-facing UI. Every route here requires the owner and explicitly rejects a
