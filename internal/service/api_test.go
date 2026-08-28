@@ -21,6 +21,12 @@ const (
 
 func newTestAPI(t *testing.T) http.Handler {
 	t.Helper()
+	handler, _ := newTestAPIWithStore(t)
+	return handler
+}
+
+func newTestAPIWithStore(t *testing.T) (http.Handler, *store.Store) {
+	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -40,12 +46,18 @@ func newTestAPI(t *testing.T) http.Handler {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return New(st, dnsops.New(st)).Handler()
+	return New(st, dnsops.New(st)).Handler(), st
 }
 
 // call issues a service request the way the router would: with a consumer identity and a
 // pre-filtered permissions array.
-func call(t *testing.T, h http.Handler, path string, body any, perms string) (int, resultsResponse, map[string]any) {
+func call(
+	t *testing.T,
+	h http.Handler,
+	path string,
+	body any,
+	perms string,
+) (int, resultsResponse, map[string]any) {
 	t.Helper()
 	var buf bytes.Buffer
 	if body != nil {
@@ -168,6 +180,52 @@ func TestReadsAreFilteredToGrantedRecords(t *testing.T) {
 	}
 }
 
+func TestRecordReadsDoNotCreateAuditRows(t *testing.T) {
+	h, st := newTestAPIWithStore(t)
+	perms := globalGrant("**", "TXT", "rw")
+
+	for i := 0; i < 3; i++ {
+		if code, _, _ := call(t, h, "/records/get", map[string]any{"zone": zoneA}, perms); code != http.StatusOK {
+			t.Fatalf("read %d returned %d", i+1, code)
+		}
+	}
+	entries, err := st.AuditEntries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("repeated reads created audit rows: %+v", entries)
+	}
+
+	mutation := map[string]any{
+		"zone": zoneA,
+		"records": []map[string]any{
+			{"name": "audited", "type": "TXT", "ttl": 60, "data": "value"},
+		},
+	}
+	if code, _, raw := call(t, h, "/records/set", mutation, perms); code != http.StatusOK {
+		t.Fatalf("mutation returned %d: %v", code, raw)
+	}
+	entries, err = st.AuditEntries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Op != "set" {
+		t.Fatalf("mutation should create one set audit row, got %+v", entries)
+	}
+
+	for i := 0; i < 3; i++ {
+		call(t, h, "/records/get", map[string]any{"zone": zoneA}, perms)
+	}
+	entries, err = st.AuditEntries(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("reads after the mutation changed the audit row count: %+v", entries)
+	}
+}
+
 func TestNoGrantsSeesNothingAndCannotListZones(t *testing.T) {
 	h := newTestAPI(t)
 	code, res, _ := call(t, h, "/records/get", map[string]any{"zone": zoneA}, "")
@@ -283,6 +341,27 @@ func TestOwnerSessionCannotUseTheServiceAPI(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsTrailingJSON(t *testing.T) {
+	h := newTestAPI(t)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/records/get",
+		bytes.NewBufferString(`{"zone":"example.com"} {}`),
+	)
+	req.Header.Set(auth.HeaderConsumerID, "consumer-app-id")
+	req.Header.Set(auth.HeaderPermissions, globalGrant("**", "**", "r"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	var body errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusBadRequest || body.Error != "invalid_request" {
+		t.Fatalf("expected 400 invalid_request, got %d %+v", rec.Code, body)
+	}
+}
+
 func TestAppScopedGrantsAreIgnored(t *testing.T) {
 	h := newTestAPI(t)
 	appScoped := `[{"grant":{"name":"**","type":"**","access":"rw"},"scope":"app"}]`
@@ -375,6 +454,46 @@ func TestDeleteWithoutDataClearsTheWholeRRset(t *testing.T) {
 	}
 }
 
+func TestDeleteRejectsPresentBlankOrNullDataWithoutChangingRecords(t *testing.T) {
+	tests := []struct {
+		name string
+		data any
+	}{
+		{name: "empty", data: ""},
+		{name: "whitespace", data: " \t\n"},
+		{name: "null", data: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newTestAPI(t)
+			perms := globalGrant("**", "TXT", "rw")
+			seed := map[string]any{"zone": zoneA, "records": []map[string]any{
+				{"name": "keep", "type": "TXT", "ttl": 60, "data": "still-here"},
+			}}
+			if code, _, raw := call(t, h, "/records/set", seed, perms); code != http.StatusOK {
+				t.Fatalf("seed returned %d: %v", code, raw)
+			}
+
+			request := map[string]any{"zone": zoneA, "records": []map[string]any{
+				{"name": "keep", "type": "TXT", "ttl": 60, "data": tt.data},
+			}}
+			code, _, raw := call(t, h, "/records/delete", request, perms)
+			if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
+				t.Fatalf("expected 400 invalid_record, got %d %v", code, raw)
+			}
+
+			_, results, _ := call(t, h, "/records/get", map[string]any{"zone": zoneA}, perms)
+			if len(results.Results) != 1 || len(results.Results[0].Records) != 1 {
+				t.Fatalf("rejected delete changed records: %+v", results.Results)
+			}
+			if got := results.Results[0].Records[0]; got.Name != "keep" || got.Data != "still-here" {
+				t.Fatalf("rejected delete changed record to %+v", got)
+			}
+		})
+	}
+}
+
 // The clear must respect the same grant check as any other write.
 func TestClearingAnRRsetOutsideTheGrantIsRefused(t *testing.T) {
 	h := newTestAPI(t)
@@ -406,16 +525,33 @@ func TestClearingAnEmptyRRsetSucceeds(t *testing.T) {
 	}
 }
 
-// Omitting data is a wildcard only when removing records; on a set or append it is a mistake.
-func TestSetAndAppendStillRequireData(t *testing.T) {
-	h := newTestAPI(t)
+// Omitting data is a wildcard only when removing records; set and append require a nonblank string.
+func TestSetAndAppendRequireNonblankData(t *testing.T) {
+	tests := []struct {
+		name    string
+		include bool
+		data    any
+	}{
+		{name: "omitted"},
+		{name: "empty", include: true, data: ""},
+		{name: "whitespace", include: true, data: " \t\n"},
+		{name: "null", include: true, data: nil},
+	}
+
 	for _, path := range []string{"/records/set", "/records/append"} {
-		body := map[string]any{"zone": zoneA, "records": []map[string]any{
-			{"name": "_acme-challenge.x", "type": "TXT"},
-		}}
-		code, _, raw := call(t, h, path, body, acmeGrant)
-		if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
-			t.Errorf("%s with no data: expected 400 invalid_record, got %d %v", path, code, raw)
+		for _, tt := range tests {
+			t.Run(path+"/"+tt.name, func(t *testing.T) {
+				h := newTestAPI(t)
+				record := map[string]any{"name": "_acme-challenge.x", "type": "TXT"}
+				if tt.include {
+					record["data"] = tt.data
+				}
+				body := map[string]any{"zone": zoneA, "records": []map[string]any{record}}
+				code, _, raw := call(t, h, path, body, acmeGrant)
+				if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
+					t.Errorf("expected 400 invalid_record, got %d %v", code, raw)
+				}
+			})
 		}
 	}
 }

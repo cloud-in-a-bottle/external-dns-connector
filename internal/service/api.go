@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -136,15 +137,35 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request, caller auth.Call
 		}
 		results = append(results, dnsops.ZoneResult{Zone: z.Zone, OK: true, Records: visible})
 	}
-	a.audit(caller, "get", zone, map[string]any{"name": req.Name, "type": req.Type}, results)
 	writeResults(w, results)
 }
 
 // ─── writes ───
 
 type writeRequest struct {
-	Zone    string         `json:"zone"`
-	Records []records.Wire `json:"records"`
+	Zone    string          `json:"zone"`
+	Records []recordRequest `json:"records"`
+}
+
+type recordRequest struct {
+	Name string          `json:"name"`
+	Type string          `json:"type"`
+	TTL  int             `json:"ttl"`
+	Data json.RawMessage `json:"data,omitempty"`
+}
+
+func (r recordRequest) toWire() (records.Wire, bool, error) {
+	wire := records.Wire{Name: r.Name, Type: r.Type, TTL: r.TTL}
+	if r.Data == nil {
+		return wire, false, nil
+	}
+
+	var data *string
+	if err := json.Unmarshal(r.Data, &data); err != nil || data == nil {
+		return records.Wire{}, true, fmt.Errorf("record %s/%s data must be a non-null string", r.Name, r.Type)
+	}
+	wire.Data = *data
+	return wire, true, nil
 }
 
 func (a *API) write(op dnsops.WriteOp) consumerHandler {
@@ -242,20 +263,24 @@ type batch struct {
 	clears []records.RRset
 }
 
-func parseBatch(wire []records.Wire, zone string, op dnsops.WriteOp) (batch, error) {
+func parseBatch(requests []recordRequest, zone string, op dnsops.WriteOp) (batch, error) {
 	var b batch
-	for _, w := range wire {
+	for _, request := range requests {
+		wire, dataPresent, err := request.toWire()
+		if err != nil {
+			return batch{}, err
+		}
 		// Omitting data means "whatever is there now", which only makes sense when removing records.
 		// A set or append with no data is a mistake, not a wildcard.
-		if strings.TrimSpace(w.Data) == "" && op == dnsops.OpDelete {
-			set, err := w.ToRRset(zone)
+		if !dataPresent && op == dnsops.OpDelete {
+			set, err := wire.ToRRset(zone)
 			if err != nil {
 				return batch{}, err
 			}
 			b.clears = append(b.clears, set)
 			continue
 		}
-		rec, err := w.ToLibDNS(zone)
+		rec, err := wire.ToLibDNS(zone)
 		if err != nil {
 			return batch{}, err
 		}
@@ -363,6 +388,9 @@ func decode(w http.ResponseWriter, r *http.Request, into any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(into); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("invalid JSON body: must contain exactly one JSON value")
 	}
 	return nil
 }

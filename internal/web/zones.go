@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -111,13 +112,27 @@ type replaceZonesRequest struct {
 	Zones []store.ZoneBinding `json:"zones"`
 }
 
+type replaceZonesResponse struct {
+	Zones []string `json:"zones"`
+}
+
 // handleZonesReplace is the single route that sets the zone set. It is owner-only by construction:
 // ownerOnly rejects anything carrying a consumer identity, and the service API exposes no
 // zone-mutating operation at all, so no permission grant can reach this.
 func (s *Server) handleZonesReplace(w http.ResponseWriter, r *http.Request) {
 	var req replaceZonesRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		http.Error(w, "invalid JSON body: must contain exactly one JSON value", http.StatusBadRequest)
+		return
+	}
+	if req.Zones == nil {
+		http.Error(w, "invalid JSON body: zones must be present and non-null", http.StatusBadRequest)
 		return
 	}
 	for _, b := range req.Zones {
@@ -145,7 +160,7 @@ func (s *Server) handleZonesReplace(w http.ResponseWriter, r *http.Request) {
 		names = append(names, z.Zone)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"zones": names})
+	_ = json.NewEncoder(w).Encode(replaceZonesResponse{Zones: names})
 }
 
 // discoverZones asks each provider which zones it can see, to prefill the add-zone form.
@@ -154,7 +169,11 @@ func (s *Server) handleZonesReplace(w http.ResponseWriter, r *http.Request) {
 // concurrently under a short shared deadline, and a provider that is slow, unreachable, holds stale
 // credentials, or cannot list zones at all simply contributes nothing. Doing it serially and
 // unbounded — as this first did — meant one unresponsive provider hung the whole page.
-func (s *Server) discoverZones(ctx context.Context, accounts []store.Account, configured map[string]bool) []string {
+func (s *Server) discoverZones(
+	ctx context.Context,
+	accounts []store.Account,
+	configured map[string]bool,
+) []string {
 	ctx, cancel := context.WithTimeout(ctx, zoneDiscoveryTimeout)
 	defer cancel()
 
