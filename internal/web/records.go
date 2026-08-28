@@ -113,7 +113,7 @@ func formRecord(r *http.Request, zone string) (libdns.Record, error) {
 	if err := r.ParseForm(); err != nil {
 		return nil, err
 	}
-	ttl, err := strconv.Atoi(strings.TrimSpace(r.FormValue("ttl")))
+	ttl, err := strconv.ParseInt(strings.TrimSpace(r.FormValue("ttl")), 10, 64)
 	if err != nil {
 		return nil, errors.New("TTL must be a whole number of seconds")
 	}

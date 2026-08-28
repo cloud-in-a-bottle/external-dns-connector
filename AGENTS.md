@@ -13,7 +13,8 @@
 - owner routes (`internal/web`) reject anything with a consumer identity. service routes
   (`internal/service`) reject anything without one. provider credentials and zone binding mutations
   exist only on the owner side, so no permission grant can reach them. the service `/zones` route does
-  expose configured zone names to a consumer with at least one valid, nonempty DNS grant.
+  expose configured zone names to a consumer with at least one valid, nonempty DNS grant; callers
+  without one receive an empty list.
 - this rests on the router being the sole authority for `X-OpenHost-*` headers. it is:
   `_sanitize_forwarded_headers` in `compute_space/src/compute_space/web/helpers/proxy.py` strips all
   inbound ones before adding its own, and app ports are published on host loopback only. the
@@ -37,9 +38,9 @@
 - libdns provider module versions have nothing to do with the libdns version they target
   (`libdns/cloudflare` v0.2.2 requires libdns v1.1.0). several are `/v2` module paths. check
   `go.mod` at the tag before bumping.
-- `libdns.RR.Parse()` derives A vs AAAA from the address family, so an "A" record holding an IPv6
-  literal comes back as AAAA. `records.Wire.ToLibDNS` rejects any record whose type changed during
-  parsing — without that, an app granted `A` could write an `AAAA`.
+- `libdns.RR.Parse()` can rewrite tuple fields: it derives A vs AAAA from the address family and adds
+  service/transport underscores to some SRV names. `records.Wire.ToLibDNS` rejects any record whose
+  normalized name or type changed during parsing; authorization covered the original tuple only.
 - `SetRecords` has RRset semantics: it replaces every record with the same (name, type). the owner
   UI's add-record form uses `append` for that reason.
 - if the app test harness doesn't match real openhost behavior, stop and say so rather than working

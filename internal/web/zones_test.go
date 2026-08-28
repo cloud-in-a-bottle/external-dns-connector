@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +58,10 @@ func TestZonesReplaceRejectsInvalidBodiesWithoutChangingZones(t *testing.T) {
 		{name: "null zones", body: `{"zones":null}`},
 		{name: "trailing JSON", body: `{"zones":[]} {}`},
 		{name: "malformed JSON", body: `{"zones":[}`},
+		{
+			name: "invalid zone name",
+			body: `{"zones":[{"zone":"bad..example","account_id":1}]}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -72,6 +78,51 @@ func TestZonesReplaceRejectsInvalidBodiesWithoutChangingZones(t *testing.T) {
 			}
 			if len(zones) != 1 || zones[0].Zone != "example.com" || zones[0].AccountID != accountID {
 				t.Fatalf("rejected request changed zones: %+v", zones)
+			}
+		})
+	}
+}
+
+func TestZoneFormsRejectInvalidNamesWithoutChangingZones(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		zone string
+	}{
+		{name: "add empty label", path: "/zones/add", zone: "bad..example"},
+		{name: "add multiple trailing dots", path: "/zones/add", zone: "example.com.."},
+		{name: "delete wildcard", path: "/zones/delete", zone: "*"},
+		{name: "delete invalid character", path: "/zones/delete", zone: "bad_name.example"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, handler, accountID := newZonesTestHandler(t)
+			form := url.Values{
+				"zone":       {tt.zone},
+				"account_id": {strconv.FormatInt(accountID, 10)},
+			}
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set(auth.HeaderIsOwner, "true")
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusSeeOther {
+				t.Fatalf("expected error redirect, got %d: %s", rec.Code, rec.Body.String())
+			}
+			location, err := url.Parse(rec.Header().Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if location.Query().Get("err") == "" {
+				t.Fatalf("redirect did not report validation error: %q", location.String())
+			}
+			zones, err := st.Zones()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(zones) != 1 || zones[0].Zone != "example.com" {
+				t.Fatalf("rejected form changed zones: %+v", zones)
 			}
 		})
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/auth"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/dnsops"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/dnsprov"
+	"github.com/cloud-in-a-bottle/external-dns-connector/internal/records"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/store"
 )
 
@@ -283,6 +284,16 @@ func TestRecordReadsDoNotCreateAuditRows(t *testing.T) {
 	if len(entries) != 1 || entries[0].Op != "set" {
 		t.Fatalf("mutation should create one set audit row, got %+v", entries)
 	}
+	var detail []recordRequest
+	if err := json.Unmarshal([]byte(entries[0].Detail), &detail); err != nil {
+		t.Fatalf("decode audit detail: %v", err)
+	}
+	if len(detail) != 1 {
+		t.Fatalf("audit detail = %+v, want one record", detail)
+	}
+	if ttl, err := detail[0].TTL.seconds(true); err != nil || ttl != 60 {
+		t.Fatalf("audit detail TTL = %d, %v; want 60", ttl, err)
+	}
 
 	for i := 0; i < 3; i++ {
 		call(t, h, "/records/get", map[string]any{"zone": zoneA}, perms)
@@ -296,7 +307,7 @@ func TestRecordReadsDoNotCreateAuditRows(t *testing.T) {
 	}
 }
 
-func TestNoGrantsSeesNothingAndCannotListZones(t *testing.T) {
+func TestNoGrantsSeesNoRecordsOrZones(t *testing.T) {
 	h := newTestAPI(t)
 	code, res, _ := call(t, h, "/records/get", map[string]any{"zone": zoneA}, "")
 	if code != http.StatusOK {
@@ -307,8 +318,13 @@ func TestNoGrantsSeesNothingAndCannotListZones(t *testing.T) {
 			t.Errorf("an app with no grants saw records: %+v", zr.Records)
 		}
 	}
-	if code, _, _ := call(t, h, "/zones", nil, ""); code != http.StatusForbidden {
-		t.Errorf("zone listing should need at least one grant, got %d", code)
+	code, _, raw := call(t, h, "/zones", nil, "")
+	if code != http.StatusOK {
+		t.Fatalf("zone listing returned %d, want 200", code)
+	}
+	zones, ok := raw["zones"].([]any)
+	if !ok || len(zones) != 0 {
+		t.Errorf("an app with no grants should receive an empty zone list, got %v", raw)
 	}
 }
 
@@ -400,6 +416,47 @@ func TestDeleteRemovesOnlyTheNamedRecord(t *testing.T) {
 	}
 }
 
+func TestExactDeleteIgnoresOmittedOrDifferentTTL(t *testing.T) {
+	tests := []struct {
+		name       string
+		includeTTL bool
+		ttl        int64
+	}{
+		{name: "omitted"},
+		{name: "different", includeTTL: true, ttl: records.MaxTTLSeconds},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newTestAPI(t)
+			permissions := globalGrant("**", "TXT", "rw")
+			seed := map[string]any{
+				"zone": zoneA,
+				"records": []map[string]any{{
+					"name": "drop", "type": "TXT", "ttl": 60, "data": "drop-me",
+				}},
+			}
+			if code, _, raw := call(t, h, "/records/set", seed, permissions); code != http.StatusOK {
+				t.Fatalf("seed returned %d: %v", code, raw)
+			}
+
+			target := map[string]any{"name": "drop", "type": "TXT", "data": "drop-me"}
+			if tt.includeTTL {
+				target["ttl"] = tt.ttl
+			}
+			request := map[string]any{"zone": zoneA, "records": []map[string]any{target}}
+			if code, _, raw := call(t, h, "/records/delete", request, permissions); code != http.StatusOK {
+				t.Fatalf("delete returned %d: %v", code, raw)
+			}
+
+			_, results, _ := call(t, h, "/records/get", map[string]any{"zone": zoneA}, permissions)
+			if len(results.Results) != 1 || len(results.Results[0].Records) != 0 {
+				t.Fatalf("delete left records behind: %+v", results.Results)
+			}
+		})
+	}
+}
+
 func TestOwnerSessionCannotUseTheServiceAPI(t *testing.T) {
 	h := newTestAPI(t)
 	req := httptest.NewRequest(http.MethodPost, "/records/get", bytes.NewBufferString(`{}`))
@@ -473,6 +530,28 @@ func TestARecordGrantCannotWriteAAAA(t *testing.T) {
 		if len(zr.Records) != 0 {
 			t.Errorf("an AAAA record was written under an A-only grant: %+v", zr.Records)
 		}
+	}
+}
+
+// libdns treats the first two SRV name labels as service and transport and adds underscores when it
+// serializes the parsed record. A grant for the unprefixed tuple must not authorize that other name.
+func TestSRVGrantCannotWriteParserRewrittenName(t *testing.T) {
+	h := newTestAPI(t)
+	body := map[string]any{
+		"zone": zoneA,
+		"records": []map[string]any{{
+			"name": "sip.tcp", "type": "SRV", "ttl": 60,
+			"data": "10 5 5060 sip.example.com.",
+		}},
+	}
+	code, _, raw := call(t, h, "/records/set", body, globalGrant("sip.tcp", "SRV", "rw"))
+	if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
+		t.Fatalf("expected 400 invalid_record, got %d %v", code, raw)
+	}
+
+	_, results, _ := call(t, h, "/records/get", map[string]any{"zone": zoneA}, globalGrant("**", "**", "r"))
+	if len(results.Results) != 1 || len(results.Results[0].Records) != 0 {
+		t.Fatalf("parser-rewritten SRV record was written: %+v", results.Results)
 	}
 }
 
@@ -612,7 +691,7 @@ func TestSetAndAppendRequireNonblankData(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(path+"/"+tt.name, func(t *testing.T) {
 				h := newTestAPI(t)
-				record := map[string]any{"name": "_acme-challenge.x", "type": "TXT"}
+				record := map[string]any{"name": "_acme-challenge.x", "type": "TXT", "ttl": 60}
 				if tt.include {
 					record["data"] = tt.data
 				}
@@ -623,5 +702,120 @@ func TestSetAndAppendRequireNonblankData(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestSetAndAppendRequirePresentInRangeIntegerTTL(t *testing.T) {
+	invalid := []struct {
+		name    string
+		include bool
+		value   any
+	}{
+		{name: "omitted"},
+		{name: "null", include: true, value: nil},
+		{name: "string", include: true, value: "60"},
+		{name: "fraction", include: true, value: 1.5},
+		{name: "zero", include: true, value: 0},
+		{name: "negative", include: true, value: -1},
+		{name: "above maximum", include: true, value: uint64(records.MaxTTLSeconds) + 1},
+	}
+
+	for _, path := range []string{"/records/set", "/records/append"} {
+		for _, tt := range invalid {
+			t.Run(path+"/"+tt.name, func(t *testing.T) {
+				h := newTestAPI(t)
+				record := map[string]any{
+					"name": "_acme-challenge.ttl", "type": "TXT", "data": "value",
+				}
+				if tt.include {
+					record["ttl"] = tt.value
+				}
+				body := map[string]any{"zone": zoneA, "records": []map[string]any{record}}
+				code, _, raw := call(t, h, path, body, acmeGrant)
+				if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
+					t.Fatalf("expected 400 invalid_record, got %d %v", code, raw)
+				}
+			})
+		}
+	}
+
+	for _, path := range []string{"/records/set", "/records/append"} {
+		for _, ttl := range []int64{records.MinTTLSeconds, records.MaxTTLSeconds} {
+			t.Run(path+"/valid-bound", func(t *testing.T) {
+				h := newTestAPI(t)
+				body := map[string]any{
+					"zone": zoneA,
+					"records": []map[string]any{{
+						"name": "_acme-challenge.ttl", "type": "TXT", "ttl": ttl, "data": "value",
+					}},
+				}
+				code, results, raw := call(t, h, path, body, acmeGrant)
+				if code != http.StatusOK || !results.OK {
+					t.Fatalf("valid TTL %d returned %d: %v", ttl, code, raw)
+				}
+			})
+		}
+	}
+}
+
+func TestInvalidTTLIsBadRequestEvenWithoutAGrant(t *testing.T) {
+	h := newTestAPI(t)
+	body := map[string]any{
+		"zone": zoneA,
+		"records": []map[string]any{{
+			"name": "home", "type": "A", "data": "192.0.2.1",
+		}},
+	}
+	code, _, raw := call(t, h, "/records/set", body, "")
+	if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
+		t.Fatalf("expected 400 invalid_record, got %d %v", code, raw)
+	}
+}
+
+func TestDeleteTTLIsOptionalButValidatedWhenPresent(t *testing.T) {
+	invalid := []struct {
+		name  string
+		value any
+	}{
+		{name: "null", value: nil},
+		{name: "string", value: "60"},
+		{name: "fraction", value: 1.5},
+		{name: "zero", value: 0},
+		{name: "negative", value: -1},
+		{name: "above maximum", value: uint64(records.MaxTTLSeconds) + 1},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newTestAPI(t)
+			body := map[string]any{
+				"zone": zoneA,
+				"records": []map[string]any{{
+					"name": "_acme-challenge.ttl", "type": "TXT", "ttl": tt.value,
+				}},
+			}
+			code, _, raw := call(t, h, "/records/delete", body, acmeGrant)
+			if code != http.StatusBadRequest || raw["error"] != "invalid_record" {
+				t.Fatalf("expected 400 invalid_record, got %d %v", code, raw)
+			}
+		})
+	}
+
+	for _, ttl := range []any{nil, records.MinTTLSeconds, records.MaxTTLSeconds} {
+		name := "omitted"
+		if ttl != nil {
+			name = "present"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newTestAPI(t)
+			record := map[string]any{"name": "_acme-challenge.ttl", "type": "TXT"}
+			if ttl != nil {
+				record["ttl"] = ttl
+			}
+			body := map[string]any{"zone": zoneA, "records": []map[string]any{record}}
+			code, results, raw := call(t, h, "/records/delete", body, acmeGrant)
+			if code != http.StatusOK || !results.OK {
+				t.Fatalf("valid delete TTL returned %d: %v", code, raw)
+			}
+		})
 	}
 }

@@ -1,6 +1,9 @@
 package grants
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMatch(t *testing.T) {
 	cases := []struct {
@@ -121,5 +124,103 @@ func TestParseDegradesToNoAccess(t *testing.T) {
 		if got := Parse(header); !got.Empty() {
 			t.Errorf("Parse(%q) = %v, want empty", header, got)
 		}
+	}
+}
+
+func TestGrantValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		grant   Grant
+		wantErr bool
+	}{
+		{name: "exact", grant: Grant{Name: "home", Type: "A", Access: AccessRead}},
+		{name: "lowercase type", grant: Grant{Name: "HOME", Type: "txt", Access: AccessWrite}},
+		{name: "generic type token", grant: Grant{Name: "@", Type: "TYPE65", Access: AccessRead}},
+		{name: "all wildcard", grant: Grant{Name: "**", Type: "**", Access: AccessRead}},
+		{
+			name:  "name wildcard fragments",
+			grant: Grant{Name: "_acme-**.service", Type: "TXT", Access: AccessWrite},
+		},
+		{
+			name:  "literal wildcard labels",
+			grant: Grant{Name: "*.app.*", Type: "CNAME", Access: AccessWrite},
+		},
+		{name: "missing name", grant: Grant{Type: "A", Access: AccessRead}, wantErr: true},
+		{name: "name whitespace", grant: Grant{Name: " home", Type: "A", Access: AccessRead}, wantErr: true},
+		{name: "empty name label", grant: Grant{Name: "bad..name", Type: "A", Access: AccessRead}, wantErr: true},
+		{name: "qualified name", grant: Grant{Name: "name.", Type: "A", Access: AccessRead}, wantErr: true},
+		{
+			name: "invalid name character", grant: Grant{Name: "bad!name", Type: "A", Access: AccessRead},
+			wantErr: true,
+		},
+		{
+			name: "embedded single star", grant: Grant{Name: "bad*name", Type: "A", Access: AccessRead},
+			wantErr: true,
+		},
+		{name: "three stars", grant: Grant{Name: "***", Type: "A", Access: AccessRead}, wantErr: true},
+		{name: "leading hyphen", grant: Grant{Name: "-bad", Type: "A", Access: AccessRead}, wantErr: true},
+		{name: "trailing hyphen", grant: Grant{Name: "bad-", Type: "A", Access: AccessRead}, wantErr: true},
+		{
+			name: "overlong name label",
+			grant: Grant{
+				Name: strings.Repeat("a", 64), Type: "A", Access: AccessRead,
+			},
+			wantErr: true,
+		},
+		{name: "missing type", grant: Grant{Name: "home", Access: AccessRead}, wantErr: true},
+		{name: "single type star", grant: Grant{Name: "home", Type: "*", Access: AccessRead}, wantErr: true},
+		{name: "type wildcard suffix", grant: Grant{Name: "home", Type: "A**", Access: AccessRead}, wantErr: true},
+		{name: "type wildcard prefix", grant: Grant{Name: "home", Type: "**A", Access: AccessRead}, wantErr: true},
+		{name: "numeric type", grant: Grant{Name: "home", Type: "65", Access: AccessRead}, wantErr: true},
+		{name: "type punctuation", grant: Grant{Name: "home", Type: "A-B", Access: AccessRead}, wantErr: true},
+		{name: "type whitespace", grant: Grant{Name: "home", Type: " A", Access: AccessRead}, wantErr: true},
+		{name: "invalid access", grant: Grant{Name: "home", Type: "A", Access: "write"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.grant.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("Validate accepted invalid grant")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("Validate rejected valid grant: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseRejectsUnknownFieldsPerEntry(t *testing.T) {
+	header := `[
+  {"grant":{"name":"home","type":"txt","access":"rw"},"scope":"global"},
+  {"grant":{"name":"**","type":"**","access":"rw"},"scope":"global","extra":true},
+  {"grant":{"name":"**","type":"**","access":"rw","extra":true},"scope":"global"}
+]`
+	got := Parse(header)
+	if len(got) != 1 {
+		t.Fatalf("Parse kept %d grants (%v), want only the strict valid entry", len(got), got)
+	}
+	want := Grant{Name: "home", Type: "TXT", Access: AccessWrite}
+	if got[0] != want {
+		t.Fatalf("Parse returned %+v, want %+v", got[0], want)
+	}
+	if got.CanWrite("other", "A") {
+		t.Fatal("an entry with an unknown field widened access")
+	}
+}
+
+func TestParseSkipsMalformedPatternsWithoutDroppingValidEntries(t *testing.T) {
+	header := `[
+  {"grant":{"name":"allowed","type":"A","access":"r"},"scope":"global"},
+  {"grant":{"name":"**","type":"A**","access":"rw"},"scope":"global"},
+  {"grant":{"name":"bad*name","type":"A","access":"rw"},"scope":"global"},
+  {"grant":{"name":"**","type":"**","access":"write"},"scope":"global"}
+]`
+	got := Parse(header)
+	if len(got) != 1 || !got.CanRead("allowed", "A") {
+		t.Fatalf("valid narrow grant was not retained: %v", got)
+	}
+	if got.CanWrite("allowed", "A") || got.CanRead("anything", "TXT") {
+		t.Fatalf("malformed entries widened access: %v", got)
 	}
 }

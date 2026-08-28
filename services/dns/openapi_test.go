@@ -21,8 +21,35 @@ type contractGetRequestWithUnknownField struct {
 type contractRecord struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
-	TTL  int    `json:"ttl"`
+	TTL  int64  `json:"ttl"`
 	Data string `json:"data"`
+}
+
+type contractRecordWithoutTTL struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Data string `json:"data"`
+}
+
+type contractRecordWithNullTTL struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	TTL  *int64 `json:"ttl"`
+	Data string `json:"data"`
+}
+
+type contractRecordWithStringTTL struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	TTL  string `json:"ttl"`
+	Data string `json:"data"`
+}
+
+type contractRecordWithFloatTTL struct {
+	Name string  `json:"name"`
+	Type string  `json:"type"`
+	TTL  float64 `json:"ttl"`
+	Data string  `json:"data"`
 }
 
 type contractZoneResult struct {
@@ -44,14 +71,43 @@ type contractDeleteTarget struct {
 type contractExactDeleteTarget struct {
 	Name string  `json:"name"`
 	Type string  `json:"type"`
-	TTL  int     `json:"ttl,omitempty"`
+	TTL  int64   `json:"ttl"`
 	Data *string `json:"data"`
+}
+
+type contractDeleteTargetWithNullTTL struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	TTL  *int64 `json:"ttl"`
+}
+
+type contractDeleteTargetWithStringTTL struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	TTL  string `json:"ttl"`
+}
+
+type contractDeleteTargetWithFloatTTL struct {
+	Name string  `json:"name"`
+	Type string  `json:"type"`
+	TTL  float64 `json:"ttl"`
 }
 
 type contractGrant struct {
 	Name   string `json:"name"`
 	Type   string `json:"type"`
 	Access string `json:"access"`
+}
+
+type contractGrantWithUnknownField struct {
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	Access string `json:"access"`
+	Extra  bool   `json:"extra"`
+}
+
+type contractZonesResponse struct {
+	Zones []string `json:"zones"`
 }
 
 type contractRequiredGrant struct {
@@ -127,6 +183,26 @@ func TestReadAndMutationRecordTypes(t *testing.T) {
 	assertRejects(t, writeRecord, contractRecord{Name: "@", Type: "SOA", TTL: 300, Data: "soa data"})
 }
 
+func TestWriteRecordTTLContract(t *testing.T) {
+	schema := componentSchema(t, loadDocument(t), "WriteRecord")
+	for _, ttl := range []int64{1, 4294967295} {
+		assertAccepts(t, schema, contractRecord{Name: "www", Type: "A", TTL: ttl, Data: "192.0.2.1"})
+	}
+	for _, ttl := range []int64{-1, 0, 4294967296} {
+		assertRejects(t, schema, contractRecord{Name: "www", Type: "A", TTL: ttl, Data: "192.0.2.1"})
+	}
+	assertRejects(t, schema, contractRecordWithoutTTL{Name: "www", Type: "A", Data: "192.0.2.1"})
+	assertRejects(t, schema, contractRecordWithNullTTL{
+		Name: "www", Type: "A", TTL: nil, Data: "192.0.2.1",
+	})
+	assertRejects(t, schema, contractRecordWithStringTTL{
+		Name: "www", Type: "A", TTL: "60", Data: "192.0.2.1",
+	})
+	assertRejects(t, schema, contractRecordWithFloatTTL{
+		Name: "www", Type: "A", TTL: 1.5, Data: "192.0.2.1",
+	})
+}
+
 func TestDeleteTargetDataContract(t *testing.T) {
 	doc := loadDocument(t)
 	schema := componentSchema(t, doc, "DeleteTarget")
@@ -141,6 +217,46 @@ func TestDeleteTargetDataContract(t *testing.T) {
 			Name: "_acme-challenge", Type: "TXT", TTL: 60, Data: invalid,
 		})
 	}
+}
+
+func TestDeleteTargetTTLContract(t *testing.T) {
+	schema := componentSchema(t, loadDocument(t), "DeleteTarget")
+	assertAccepts(t, schema, contractDeleteTarget{Name: "_acme-challenge", Type: "TXT"})
+	for _, ttl := range []int64{1, 4294967295} {
+		assertAccepts(t, schema, contractExactDeleteTarget{
+			Name: "_acme-challenge", Type: "TXT", TTL: ttl, Data: stringPointer("token"),
+		})
+	}
+	for _, ttl := range []int64{-1, 0, 4294967296} {
+		assertRejects(t, schema, contractExactDeleteTarget{
+			Name: "_acme-challenge", Type: "TXT", TTL: ttl, Data: stringPointer("token"),
+		})
+	}
+	assertRejects(t, schema, contractDeleteTargetWithNullTTL{
+		Name: "_acme-challenge", Type: "TXT", TTL: nil,
+	})
+	assertRejects(t, schema, contractDeleteTargetWithStringTTL{
+		Name: "_acme-challenge", Type: "TXT", TTL: "60",
+	})
+	assertRejects(t, schema, contractDeleteTargetWithFloatTTL{
+		Name: "_acme-challenge", Type: "TXT", TTL: 1.5,
+	})
+}
+
+func TestZonesResponseAllowsAnEmptyList(t *testing.T) {
+	doc := loadDocument(t)
+	response := doc.Paths.Find("/zones").Post.Responses.Value("200").Value
+	schema := response.Content.Get(jsonContentType).Schema.Value
+	assertAccepts(t, schema, contractZonesResponse{Zones: []string{}})
+}
+
+func TestGrantSchemaIsClosedAndRejectsWildcardFragmentsInType(t *testing.T) {
+	schema := componentSchema(t, loadDocument(t), "Grant")
+	assertAccepts(t, schema, contractGrant{Name: "home", Type: "txt", Access: "r"})
+	assertRejects(t, schema, contractGrant{Name: "home", Type: "A**", Access: "r"})
+	assertRejects(t, schema, contractGrantWithUnknownField{
+		Name: "home", Type: "A", Access: "r", Extra: true,
+	})
 }
 
 func TestForbiddenResponseShapes(t *testing.T) {

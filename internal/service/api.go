@@ -62,9 +62,10 @@ type zonesResponse struct {
 }
 
 func (a *API) handleZones(w http.ResponseWriter, r *http.Request, caller auth.Caller) {
-	// Which domains the owner runs is not something an app with no DNS access should learn.
+	// Which domains the owner runs is not something an app with no DNS access should learn. Returning
+	// an empty list avoids both that disclosure and a permission response asking for broad access.
 	if caller.Grants.Empty() {
-		writeRequiredGrant(w, grants.Grant{Name: grants.Wildcard, Type: grants.Wildcard, Access: grants.AccessRead})
+		writeJSON(w, http.StatusOK, zonesResponse{Zones: []string{}})
 		return
 	}
 	zones, err := a.store.Zones()
@@ -150,12 +151,53 @@ type writeRequest struct {
 type recordRequest struct {
 	Name string          `json:"name"`
 	Type string          `json:"type"`
-	TTL  int             `json:"ttl"`
+	TTL  requestTTL      `json:"ttl"`
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
-func (r recordRequest) toWire() (records.Wire, bool, error) {
-	wire := records.Wire{Name: r.Name, Type: r.Type, TTL: r.TTL}
+type requestTTL struct {
+	raw json.RawMessage
+}
+
+func (t *requestTTL) UnmarshalJSON(data []byte) error {
+	t.raw = append(t.raw[:0], data...)
+	return nil
+}
+
+func (t requestTTL) MarshalJSON() ([]byte, error) {
+	if t.raw == nil {
+		return []byte("null"), nil
+	}
+	return t.raw, nil
+}
+
+func (t requestTTL) seconds(required bool) (int64, error) {
+	if t.raw == nil {
+		if required {
+			return 0, fmt.Errorf("must be explicitly present")
+		}
+		return records.MinTTLSeconds, nil
+	}
+	var seconds *int64
+	if err := json.Unmarshal(t.raw, &seconds); err != nil || seconds == nil {
+		return 0, fmt.Errorf("must be a non-null integer")
+	}
+	if *seconds < records.MinTTLSeconds || *seconds > records.MaxTTLSeconds {
+		return 0, fmt.Errorf(
+			"must be between %d and %d seconds",
+			records.MinTTLSeconds,
+			records.MaxTTLSeconds,
+		)
+	}
+	return *seconds, nil
+}
+
+func (r recordRequest) toWire(op dnsops.WriteOp) (records.Wire, bool, error) {
+	ttl, err := r.TTL.seconds(op != dnsops.OpDelete)
+	if err != nil {
+		return records.Wire{}, false, fmt.Errorf("record %s/%s ttl %w", r.Name, r.Type, err)
+	}
+	wire := records.Wire{Name: r.Name, Type: r.Type, TTL: ttl}
 	if r.Data == nil {
 		return wire, false, nil
 	}
@@ -191,6 +233,11 @@ func (a *API) write(op dnsops.WriteOp) consumerHandler {
 		// Authorizing the whole batch up front also means a partially-permitted request fails
 		// outright rather than applying its permitted half and then erroring.
 		for _, rec := range req.Records {
+			if _, err := rec.TTL.seconds(op != dnsops.OpDelete); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_record",
+					fmt.Sprintf("record %s/%s ttl %s", rec.Name, rec.Type, err))
+				return
+			}
 			name, err := records.NormalizeName(rec.Name, "")
 			if err != nil {
 				writeError(w, http.StatusBadRequest, "invalid_record", err.Error())
@@ -266,7 +313,7 @@ type batch struct {
 func parseBatch(requests []recordRequest, zone string, op dnsops.WriteOp) (batch, error) {
 	var b batch
 	for _, request := range requests {
-		wire, dataPresent, err := request.toWire()
+		wire, dataPresent, err := request.toWire(op)
 		if err != nil {
 			return batch{}, err
 		}

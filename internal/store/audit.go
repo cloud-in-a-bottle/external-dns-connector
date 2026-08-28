@@ -9,6 +9,13 @@ import (
 // auditRetentionLimit bounds persistent mutation history while retaining enough context for diagnosis.
 const auditRetentionLimit = 10_000
 
+const auditDetailLimitBytes = 16 * 1024
+
+type auditDetailTruncation struct {
+	Truncated     bool `json:"truncated"`
+	OriginalBytes int  `json:"original_bytes"`
+}
+
 // AuditEntry records who changed what. Anything that can repoint a domain is worth a trail: when
 // mail stops arriving, the first question is which app touched the MX record and when.
 type AuditEntry struct {
@@ -40,11 +47,9 @@ func (s *Store) writeAudit(
 	if retentionLimit <= 0 {
 		return fmt.Errorf("audit retention limit must be positive")
 	}
-	encoded := ""
-	if detail != nil {
-		if b, err := json.Marshal(detail); err == nil {
-			encoded = string(b)
-		}
+	encoded, err := encodeAuditDetail(detail)
+	if err != nil {
+		return err
 	}
 	errText := ""
 	if opErr != nil {
@@ -74,6 +79,27 @@ func (s *Store) writeAudit(
 		return fmt.Errorf("commit audit write: %w", err)
 	}
 	return nil
+}
+
+func encodeAuditDetail(detail any) (string, error) {
+	if detail == nil {
+		return "", nil
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		return "", fmt.Errorf("encode audit detail: %w", err)
+	}
+	if len(encoded) <= auditDetailLimitBytes {
+		return string(encoded), nil
+	}
+	marker, err := json.Marshal(auditDetailTruncation{
+		Truncated:     true,
+		OriginalBytes: len(encoded),
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode audit truncation marker: %w", err)
+	}
+	return string(marker), nil
 }
 
 func (s *Store) AuditEntries(limit int) ([]AuditEntry, error) {

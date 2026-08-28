@@ -1,9 +1,12 @@
 package grants
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/cloud-in-a-bottle/external-dns-connector/internal/records"
 )
 
 type Access string
@@ -17,7 +20,8 @@ const (
 
 // Grant is one permission entry as it appears in a consumer app's manifest. Zones are deliberately
 // absent: a grant applies to matching records in every configured zone. Only the owner can change
-// zone bindings, while any consumer with a valid nonempty grant can list configured zone names.
+// zone bindings. A consumer with a valid nonempty grant can list configured zone names; one without
+// a grant receives an empty list.
 type Grant struct {
 	Name   string `json:"name"`
 	Type   string `json:"type"`
@@ -25,16 +29,59 @@ type Grant struct {
 }
 
 func (g Grant) Validate() error {
-	if strings.TrimSpace(g.Name) == "" {
-		return fmt.Errorf("grant is missing \"name\"")
+	_, err := g.normalized()
+	return err
+}
+
+func (g Grant) normalized() (Grant, error) {
+	name, err := normalizeNamePattern(g.Name)
+	if err != nil {
+		return Grant{}, err
 	}
-	if strings.TrimSpace(g.Type) == "" {
-		return fmt.Errorf("grant is missing \"type\"")
+	rrtype, err := normalizeTypePattern(g.Type)
+	if err != nil {
+		return Grant{}, err
 	}
 	if g.Access != AccessRead && g.Access != AccessWrite {
-		return fmt.Errorf("grant has invalid access %q (want %q or %q)", g.Access, AccessRead, AccessWrite)
+		return Grant{}, fmt.Errorf(
+			"grant has invalid access %q (want %q or %q)",
+			g.Access,
+			AccessRead,
+			AccessWrite,
+		)
 	}
-	return nil
+	return Grant{Name: name, Type: rrtype, Access: g.Access}, nil
+}
+
+func normalizeNamePattern(pattern string) (string, error) {
+	if pattern == "" {
+		return "", fmt.Errorf("grant is missing \"name\"")
+	}
+	if pattern != strings.TrimSpace(pattern) {
+		return "", fmt.Errorf("grant name %q has surrounding whitespace", pattern)
+	}
+	const wildcardPlaceholder = "grant-wildcard"
+	candidate := strings.ReplaceAll(pattern, Wildcard, wildcardPlaceholder)
+	if _, err := records.NormalizeName(candidate, ""); err != nil {
+		return "", fmt.Errorf("grant has invalid name pattern %q: %w", pattern, err)
+	}
+	return strings.ToLower(pattern), nil
+}
+
+func normalizeTypePattern(pattern string) (string, error) {
+	if pattern == Wildcard {
+		return Wildcard, nil
+	}
+	if pattern == "" {
+		return "", fmt.Errorf("grant is missing \"type\"")
+	}
+	for index, char := range []byte(pattern) {
+		letter := (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z')
+		if !letter && (index == 0 || char < '0' || char > '9') {
+			return "", fmt.Errorf("grant has invalid record type pattern %q", pattern)
+		}
+	}
+	return strings.ToUpper(pattern), nil
 }
 
 func (g Grant) matches(name, rrtype string) bool {
@@ -86,23 +133,48 @@ func Parse(header string) Set {
 	if strings.TrimSpace(header) == "" {
 		return nil
 	}
-	var entries []routerGrant
+	var entries []json.RawMessage
 	if err := json.Unmarshal([]byte(header), &entries); err != nil {
 		return nil
 	}
 	out := Set{}
-	for _, e := range entries {
+	for _, raw := range entries {
+		e, err := decodeRouterGrant(raw)
+		if err != nil {
+			continue
+		}
 		if e.Scope != "global" {
 			continue
 		}
-		var g Grant
-		if err := json.Unmarshal(e.Grant, &g); err != nil {
+		g, err := decodeGrant(e.Grant)
+		if err != nil {
 			continue
 		}
-		if g.Validate() != nil {
+		normalized, err := g.normalized()
+		if err != nil {
 			continue
 		}
-		out = append(out, Grant{Name: strings.ToLower(g.Name), Type: strings.ToUpper(g.Type), Access: g.Access})
+		out = append(out, normalized)
 	}
 	return out
+}
+
+func decodeRouterGrant(raw json.RawMessage) (routerGrant, error) {
+	var entry routerGrant
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&entry); err != nil {
+		return routerGrant{}, err
+	}
+	return entry, nil
+}
+
+func decodeGrant(raw json.RawMessage) (Grant, error) {
+	var grant Grant
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&grant); err != nil {
+		return Grant{}, err
+	}
+	return grant, nil
 }

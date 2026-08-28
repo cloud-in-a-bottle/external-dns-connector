@@ -15,6 +15,11 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+const (
+	ownerContentSecurityPolicy = "frame-ancestors 'none'"
+	ownerFrameOptions          = "DENY"
+)
+
 type Server struct {
 	store             *store.Store
 	ops               *dnsops.Ops
@@ -56,7 +61,15 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /accounts/add", s.ownerOnly(s.handleAccountAdd))
 	mux.Handle("POST /accounts/delete", s.ownerOnly(s.handleAccountDelete))
 	mux.Handle("GET /audit", s.ownerOnly(s.handleAudit))
-	return mux
+	return ownerSecurityHeaders(mux)
+}
+
+func ownerSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", ownerContentSecurityPolicy)
+		w.Header().Set("X-Frame-Options", ownerFrameOptions)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) ownerOnly(h http.HandlerFunc) http.Handler {

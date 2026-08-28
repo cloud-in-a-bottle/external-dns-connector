@@ -44,13 +44,13 @@ A grant is a record name pattern, a record type, and an access level:
 
 - `name`: matched against the **zone-relative** name (`@` is the apex). `**` matches any run of
   characters; a single `*` is literal because it is a real DNS wildcard label.
-- `type`: an uppercase RR type, or `**` for any.
+- `type`: a case-insensitive RR type token, or `**` for any.
 - `access`: `r` for read, `rw` for read and write. `rw` always includes read.
 
 Grants say nothing about zones: they apply to matching records in every configured zone. Provider
-bindings and changes to the configured zone set are owner-only, but any caller with at least one
-valid, nonempty DNS grant can list all configured zone names. "Read all" is
-`{name = "**", type = "**", access = "r"}`; "write all" is the same with `rw`.
+bindings and changes to the configured zone set are owner-only. A caller with at least one valid,
+nonempty DNS grant can list all configured zone names; a caller without one receives an empty list.
+"Read all" is `{name = "**", type = "**", access = "r"}`; "write all" is the same with `rw`.
 
 The ACME example declares separate apex and subdomain patterns because `_acme-challenge.**` does not
 match the apex name `_acme-challenge`.
@@ -75,9 +75,9 @@ One flat shape covers every type, mirroring a zone file line:
 {"name": "www", "type": "A", "ttl": 300, "data": "192.0.2.1"}
 ```
 
-`name` is relative to the zone — `www`, not `www.example.com`. `ttl` is in seconds. `data` is
-unescaped zone-file RDATA, so `MX` is `"10 mail.example.com."` and `SRV` is
-`"10 5 443 host.example.com."`.
+`name` is relative to the zone — `www`, not `www.example.com`. Set and append require an integer
+`ttl` from 1 through 4294967295 seconds. `data` is unescaped zone-file RDATA, so `MX` is
+`"10 mail.example.com."` and `SRV` is `"10 5 443 host.example.com."`.
 
 Writable types: `A`, `AAAA`, `CAA`, `CNAME`, `MX`, `NS`, `SRV`, `TXT` — the basics plus what email
 needs. Reads pass through whatever the provider returns.
@@ -97,8 +97,9 @@ deleted, so it is safe to call in a `finally` or on a retry. Grants are checked 
 either way.
 
 For an exact delete, matching uses name, type, and data. TTL is ignored because DNS stores one TTL
-for the entire RRset, not a separate TTL for each value. To clear an RRset, omit `data` entirely;
-explicitly blank or null `data` is rejected.
+for the entire RRset, not a separate TTL for each value. It may be omitted, but when present it must
+still be an integer from 1 through 4294967295. To clear an RRset, omit `data` entirely; explicitly
+blank or null `data` is rejected.
 
 The full spec is in [`services/dns/openapi.yaml`](services/dns/openapi.yaml).
 

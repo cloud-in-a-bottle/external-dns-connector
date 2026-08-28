@@ -27,9 +27,9 @@ type ZoneBinding struct {
 
 // AddZone adds one binding atomically, without replacing any concurrently-added bindings.
 func (s *Store) AddZone(binding ZoneBinding) error {
-	zone := records.NormalizeZone(binding.Zone)
-	if zone == "" {
-		return errors.New("zone name is empty")
+	zone, err := records.ValidateZone(binding.Zone)
+	if err != nil {
+		return err
 	}
 	if _, err := s.db.Exec(
 		`INSERT INTO zones (zone, account_id, created_at) VALUES (?, ?, ?)`,
@@ -44,7 +44,10 @@ func (s *Store) AddZone(binding ZoneBinding) error {
 
 // DeleteZone removes one binding atomically. Removing an absent binding remains a successful no-op.
 func (s *Store) DeleteZone(name string) error {
-	zone := records.NormalizeZone(name)
+	zone, err := records.ValidateZone(name)
+	if err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`DELETE FROM zones WHERE zone = ?`, zone); err != nil {
 		return fmt.Errorf("delete zone %q: %w", zone, err)
 	}
@@ -55,6 +58,20 @@ func (s *Store) DeleteZone(name string) error {
 // zone route exposes. Replacing wholesale keeps the stored set exactly what the owner last declared,
 // with no partially-applied intermediate state.
 func (s *Store) ReplaceZones(bindings []ZoneBinding) error {
+	normalized := make([]ZoneBinding, 0, len(bindings))
+	seen := map[string]bool{}
+	for _, binding := range bindings {
+		zone, err := records.ValidateZone(binding.Zone)
+		if err != nil {
+			return err
+		}
+		if seen[zone] {
+			return fmt.Errorf("zone %q listed more than once", zone)
+		}
+		seen[zone] = true
+		normalized = append(normalized, ZoneBinding{Zone: zone, AccountID: binding.AccountID})
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin zone replace: %w", err)
@@ -65,20 +82,14 @@ func (s *Store) ReplaceZones(bindings []ZoneBinding) error {
 		return fmt.Errorf("clear zones: %w", err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	seen := map[string]bool{}
-	for _, b := range bindings {
-		zone := records.NormalizeZone(b.Zone)
-		if zone == "" {
-			return errors.New("zone name is empty")
-		}
-		if seen[zone] {
-			return fmt.Errorf("zone %q listed more than once", zone)
-		}
-		seen[zone] = true
+	for _, binding := range normalized {
 		if _, err := tx.Exec(
-			`INSERT INTO zones (zone, account_id, created_at) VALUES (?, ?, ?)`, zone, b.AccountID, now,
+			`INSERT INTO zones (zone, account_id, created_at) VALUES (?, ?, ?)`,
+			binding.Zone,
+			binding.AccountID,
+			now,
 		); err != nil {
-			return fmt.Errorf("bind zone %q to account %d: %w", zone, b.AccountID, err)
+			return fmt.Errorf("bind zone %q to account %d: %w", binding.Zone, binding.AccountID, err)
 		}
 	}
 	return tx.Commit()

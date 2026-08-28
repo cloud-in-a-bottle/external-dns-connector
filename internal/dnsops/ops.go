@@ -234,7 +234,10 @@ func (o *Ops) lockZones(ctx context.Context, zones []string) (func(), error) {
 
 // AddZone serializes one owner binding change with provider work for that zone.
 func (o *Ops) AddZone(ctx context.Context, binding store.ZoneBinding) error {
-	zone := records.NormalizeZone(binding.Zone)
+	zone, err := records.ValidateZone(binding.Zone)
+	if err != nil {
+		return err
+	}
 	o.configMu.Lock()
 	defer o.configMu.Unlock()
 
@@ -258,7 +261,10 @@ func (o *Ops) AddZone(ctx context.Context, binding store.ZoneBinding) error {
 
 // DeleteZone serializes one owner binding removal with provider work for that zone.
 func (o *Ops) DeleteZone(ctx context.Context, zone string) error {
-	zone = records.NormalizeZone(zone)
+	zone, err := records.ValidateZone(zone)
+	if err != nil {
+		return err
+	}
 	o.configMu.Lock()
 	defer o.configMu.Unlock()
 
@@ -277,6 +283,15 @@ func (o *Ops) DeleteZone(ctx context.Context, zone string) error {
 
 // ReplaceZones serializes a whole owner binding-set replacement with every possibly affected zone.
 func (o *Ops) ReplaceZones(ctx context.Context, bindings []store.ZoneBinding) error {
+	normalized := make([]store.ZoneBinding, 0, len(bindings))
+	for _, binding := range bindings {
+		zone, err := records.ValidateZone(binding.Zone)
+		if err != nil {
+			return err
+		}
+		normalized = append(normalized, store.ZoneBinding{Zone: zone, AccountID: binding.AccountID})
+	}
+
 	o.configMu.Lock()
 	defer o.configMu.Unlock()
 
@@ -284,11 +299,11 @@ func (o *Ops) ReplaceZones(ctx context.Context, bindings []store.ZoneBinding) er
 	if err != nil {
 		return err
 	}
-	affected := make([]string, 0, len(existing)+len(bindings))
+	affected := make([]string, 0, len(existing)+len(normalized))
 	for _, zone := range existing {
 		affected = append(affected, zone.Zone)
 	}
-	for _, binding := range bindings {
+	for _, binding := range normalized {
 		affected = append(affected, binding.Zone)
 	}
 	unlock, err := o.lockZones(ctx, affected)
@@ -297,7 +312,7 @@ func (o *Ops) ReplaceZones(ctx context.Context, bindings []store.ZoneBinding) er
 	}
 	defer unlock()
 
-	if err := o.store.ReplaceZones(bindings); err != nil {
+	if err := o.store.ReplaceZones(normalized); err != nil {
 		return err
 	}
 	for _, zone := range affected {

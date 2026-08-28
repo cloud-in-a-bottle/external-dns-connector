@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,9 +57,9 @@ func (s *Server) handleZoneAdd(w http.ResponseWriter, r *http.Request) {
 		redirectErr(w, r, "/", fmt.Errorf("pick a provider account"))
 		return
 	}
-	zone := records.NormalizeZone(r.FormValue("zone"))
-	if zone == "" {
-		redirectErr(w, r, "/", errors.New("zone name is required"))
+	zone, err := records.ValidateZone(r.FormValue("zone"))
+	if err != nil {
+		redirectErr(w, r, "/", err)
 		return
 	}
 
@@ -73,7 +72,11 @@ func (s *Server) handleZoneAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleZoneDelete(w http.ResponseWriter, r *http.Request) {
-	zone := records.NormalizeZone(r.FormValue("zone"))
+	zone, err := records.ValidateZone(r.FormValue("zone"))
+	if err != nil {
+		redirectErr(w, r, "/", err)
+		return
+	}
 	if err := s.ops.DeleteZone(r.Context(), zone); err != nil {
 		redirectErr(w, r, "/", err)
 		return
@@ -110,6 +113,10 @@ func (s *Server) handleZonesReplace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, b := range req.Zones {
+		if _, err := records.ValidateZone(b.Zone); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if _, err := s.store.Account(b.AccountID); err != nil {
 			http.Error(w, fmt.Sprintf("zone %q names unknown account %d", b.Zone, b.AccountID), http.StatusBadRequest)
 			return

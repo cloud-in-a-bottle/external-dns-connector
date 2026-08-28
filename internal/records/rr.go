@@ -8,12 +8,17 @@ import (
 	"github.com/libdns/libdns"
 )
 
+const (
+	MinTTLSeconds int64 = 1
+	MaxTTLSeconds int64 = 1<<32 - 1
+)
+
 // Wire is the record shape the service API and the owner UI both speak. It maps one-to-one onto
 // libdns.RR, so no record type needs its own request schema.
 type Wire struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
-	TTL  int    `json:"ttl"`
+	TTL  int64  `json:"ttl"`
 	Data string `json:"data"`
 }
 
@@ -31,8 +36,14 @@ func (w Wire) ToLibDNS(zone string) (libdns.Record, error) {
 	if strings.TrimSpace(w.Data) == "" {
 		return nil, fmt.Errorf("record %s/%s has empty data", name, rrtype)
 	}
-	if w.TTL < 0 {
-		return nil, fmt.Errorf("record %s/%s has a negative ttl", name, rrtype)
+	if w.TTL < MinTTLSeconds || w.TTL > MaxTTLSeconds {
+		return nil, fmt.Errorf(
+			"record %s/%s ttl must be between %d and %d seconds",
+			name,
+			rrtype,
+			MinTTLSeconds,
+			MaxTTLSeconds,
+		)
 	}
 	rr := libdns.RR{
 		Name: name,
@@ -44,11 +55,19 @@ func (w Wire) ToLibDNS(zone string) (libdns.Record, error) {
 	if err != nil {
 		return nil, fmt.Errorf("record %s/%s has invalid data %q: %w", name, rrtype, w.Data, err)
 	}
-	// Parsing can quietly change the type: libdns.Address derives A vs AAAA from the address family,
-	// so an "A" record carrying an IPv6 literal comes back out as AAAA. Since callers are authorized
-	// against the type they asked for, a record that changed type here would be written under a type
-	// the caller may not hold a grant for. Reject rather than reinterpret.
-	if got := strings.ToUpper(rec.RR().Type); got != rrtype {
+	// Some libdns parsers reinterpret tuple fields from data or structured components. Authorization
+	// covered the normalized tuple above, so parsing must not turn it into a different record.
+	parsed := rec.RR()
+	if parsed.Name != name {
+		return nil, fmt.Errorf(
+			"record %s/%s has data %q that rewrites its name as %q",
+			name,
+			rrtype,
+			w.Data,
+			parsed.Name,
+		)
+	}
+	if got := parsed.Type; got != rrtype {
 		return nil, fmt.Errorf("record %s/%s has data %q that is not valid for a %s record (it parses as %s)",
 			name, rrtype, w.Data, rrtype, got)
 	}
@@ -97,7 +116,7 @@ func FromLibDNS(rec libdns.Record) Wire {
 	return Wire{
 		Name: strings.ToLower(name),
 		Type: strings.ToUpper(rr.Type),
-		TTL:  int(rr.TTL / time.Second),
+		TTL:  int64(rr.TTL / time.Second),
 		Data: rr.Data,
 	}
 }
