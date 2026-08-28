@@ -15,6 +15,7 @@ FROM alpine:3.20
 # Provider APIs are all HTTPS, so the image needs the CA bundle. tzdata keeps audit timestamps sane.
 RUN apk add --no-cache ca-certificates tzdata
 COPY --from=build /out/dns-connector /usr/local/bin/dns-connector
+COPY LICENSE /licenses/external-dns-connector/LICENSE
 
 EXPOSE 8080
 CMD ["dns-connector"]

@@ -8,16 +8,9 @@ update exactly the records it needs, scoped by record name and type, without eve
 owner's registrar credentials. The owner-facing web UI configures providers and zones and can edit
 records by hand.
 
-Record operations go through [libdns](https://github.com/libdns/libdns), with 20 providers built in.
-
-## Providers
-
-Cloudflare · AWS Route 53 · DigitalOcean · Google Cloud DNS · Namecheap · GoDaddy · Gandi · Hetzner ·
-Vultr · Linode · DNSimple · Porkbun · OVH · Netlify · deSEC · Alibaba Cloud DNS · Bunny.net · LuaDNS ·
-INWX · Scaleway
-
-Plus a built-in **mock** provider backed by a local table, so the record path can be tried out and
-tested without credentials for a real registrar.
+Record operations go through [libdns](https://github.com/libdns/libdns). The bundled adapters are
+the exact module versions [pinned in `go.mod`](go.mod) and covered by this connector's conformance
+tests; support does not automatically extend to every provider in the upstream catalog.
 
 ## Using the service from another app
 

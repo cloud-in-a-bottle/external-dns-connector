@@ -1,4 +1,4 @@
-- read README.md and style_guide.md at the beginning of every session.
+- read README.md and docs/style_guide.md at the beginning of every session.
 - this is an OpenHost app written in Go. `cloudinabottle.toml` is the app manifest (`openhost.toml`
   is the legacy alias for the same file).
 - `just test-go` is the fast loop and needs nothing but Go. `just test` additionally builds the
