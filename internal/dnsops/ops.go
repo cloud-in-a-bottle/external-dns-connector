@@ -21,9 +21,8 @@ const AllZones = "*"
 // zones in that set, so a typo fails loudly instead of silently doing nothing.
 var ErrUnknownZone = errors.New("unknown zone")
 
-// cacheTTL bounds how stale a read may be. Provider APIs are rate-limited (Cloudflare allows 1200
-// requests per 5 minutes, Route 53 five per second), and without this a busy consumer polling records
-// would exhaust that budget on its own.
+// cacheTTL bounds how stale a read may be. Provider APIs are rate-limited, and without this a busy
+// consumer polling records would exhaust that budget on its own.
 const cacheTTL = 30 * time.Second
 
 type cacheEntry struct {
@@ -171,51 +170,22 @@ const (
 
 // Write applies one write operation to one zone under that zone's lock, so two callers doing
 // read-modify-write on the same zone cannot interleave.
-func (o *Ops) Write(ctx context.Context, z store.Zone, op WriteOp, recs []libdns.Record) ([]libdns.Record, error) {
-	lock := o.zoneLock(z.Zone)
-	lock.Lock()
-	defer lock.Unlock()
-	defer o.InvalidateZone(z.Zone)
-
-	p, err := o.provider(z)
-	if err != nil {
-		return nil, err
-	}
-	fqdn := z.Zone + "."
-
-	switch op {
-	case OpSet:
-		setter, ok := p.(libdns.RecordSetter)
-		if !ok {
-			return nil, fmt.Errorf("provider %s cannot set records", z.Provider)
-		}
-		return setter.SetRecords(ctx, fqdn, recs)
-	case OpAppend:
-		appender, ok := p.(libdns.RecordAppender)
-		if !ok {
-			return nil, fmt.Errorf("provider %s cannot append records", z.Provider)
-		}
-		return appender.AppendRecords(ctx, fqdn, recs)
-	case OpDelete:
-		return deleteRecords(ctx, p, z, recs)
-	default:
-		return nil, fmt.Errorf("unknown write operation %q", op)
-	}
+func (o *Ops) Write(
+	ctx context.Context, z store.Zone, op WriteOp, recs []libdns.Record,
+) ([]libdns.Record, error) {
+	return o.mutate(ctx, z, op, recs, nil)
 }
 
-// Delete removes records from a zone: `exact` records must match completely, while `clears` name
-// whole (name, type) RRsets to remove whatever they currently hold.
-//
-// The clears are expanded here rather than passed down as libdns's empty-field wildcard. libdns says
-// an implementation *may* treat an empty Data as "match anything", and in practice they disagree —
-// libdns/porkbun deletes by name and type and ignores Data entirely, libdns/cloudflare matches
-// exactly. Reading the zone and deleting the concrete records gives the same behavior on all of
-// them, which is what a cleanup path recovering from a crashed run needs.
-//
-// The read and the delete happen under one hold of the zone lock, so no other caller of this app can
-// add a record in between and have it survive the clear.
+// Delete removes exact values or whole RRsets. Exact matching deliberately ignores TTL because DNS
+// stores one TTL for the RRset rather than a separate TTL for each value.
 func (o *Ops) Delete(
 	ctx context.Context, z store.Zone, exact []libdns.Record, clears []records.RRset,
+) ([]libdns.Record, error) {
+	return o.mutate(ctx, z, OpDelete, exact, clears)
+}
+
+func (o *Ops) mutate(
+	ctx context.Context, z store.Zone, op WriteOp, recs []libdns.Record, clears []records.RRset,
 ) ([]libdns.Record, error) {
 	lock := o.zoneLock(z.Zone)
 	lock.Lock()
@@ -226,34 +196,7 @@ func (o *Ops) Delete(
 	if err != nil {
 		return nil, err
 	}
-
-	toDelete := exact
-	if len(clears) > 0 {
-		existing, err := fetch(ctx, p, z)
-		if err != nil {
-			return nil, err
-		}
-		for _, rec := range existing {
-			for _, set := range clears {
-				if set.Matches(rec) {
-					toDelete = append(toDelete, rec)
-					break
-				}
-			}
-		}
-	}
-	if len(toDelete) == 0 {
-		return nil, nil
-	}
-	return deleteRecords(ctx, p, z, toDelete)
-}
-
-func deleteRecords(ctx context.Context, p any, z store.Zone, recs []libdns.Record) ([]libdns.Record, error) {
-	deleter, ok := p.(libdns.RecordDeleter)
-	if !ok {
-		return nil, fmt.Errorf("provider %s cannot delete records", z.Provider)
-	}
-	return deleter.DeleteRecords(ctx, z.Zone+".", recs)
+	return applySemanticMutation(ctx, p, z, op, recs, clears)
 }
 
 // ListProviderZones asks a provider which zones it can see, for the owner UI's zone picker. Not every

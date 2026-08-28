@@ -12,8 +12,7 @@ import (
 // first real API call, with an error pointing at the credentials rather than at us.
 //
 // This checks the property through encoding/json itself rather than by walking struct tags with
-// reflection, because Go's own promotion rules for embedded structs are what actually decide the
-// wire shape (libdns/alidns embeds its CredentialInfo, so its keys are flat, not nested).
+// reflection, because Go's own promotion rules for embedded structs decide the actual wire shape.
 func TestFieldKeysReachTheProviderStruct(t *testing.T) {
 	for _, e := range All() {
 		t.Run(e.Key, func(t *testing.T) {
@@ -46,34 +45,64 @@ func TestFieldKeysReachTheProviderStruct(t *testing.T) {
 
 func sentinel(i int) string { return "sentinel-value-" + string(rune('a'+i)) }
 
-// TestEveryProviderImplementsTheCoreInterfaces checks that each registered provider can actually do
-// what the service API asks of it, rather than failing at runtime with a confusing "unsupported".
-func TestEveryProviderImplementsTheCoreInterfaces(t *testing.T) {
-	real := 0
+func TestProductionProvidersArePinnedAndImplementSemanticInterfaces(t *testing.T) {
+	want := map[string]string{
+		"route53": "https://github.com/libdns/route53/blob/" +
+			"840c6120709b2f9da6d74dc5d562e2625334aecc/provider.go",
+		"hetzner": "https://github.com/libdns/hetzner/blob/" +
+			"36dd896cea1474c0cbb7a6a9bf6dbc0f14a0c178/provider.go",
+	}
+	if got := len(All()); got != len(want) {
+		t.Fatalf("expected exactly %d production providers, got %d", len(want), got)
+	}
+
 	for _, e := range All() {
-		if e.Key != MockKey {
-			real++
+		source, ok := want[e.Key]
+		if !ok {
+			t.Errorf("unexpected production provider %q", e.Key)
+			continue
 		}
-	}
-	if real != 20 {
-		t.Errorf("expected 20 real providers registered, got %d", real)
-	}
-	for _, e := range All() {
+		delete(want, e.Key)
+		if e.SourceURL != source {
+			t.Errorf("%s: source URL = %q, want exact pinned source %q", e.Key, e.SourceURL, source)
+		}
 		p, err := e.New(Deps{}, nil)
 		if err != nil {
 			t.Fatalf("%s: New(nil) errored: %v", e.Key, err)
 		}
-		if c := CapabilitiesOf(p); !c.Get || !c.Append || !c.Set || !c.Delete {
-			t.Errorf("%s: missing a core interface: %+v", e.Key, c)
+		if c := CapabilitiesOf(p); !c.Get || !c.Set || !c.Delete {
+			t.Errorf("%s: missing an interface required by semantic mutations: %+v", e.Key, c)
 		}
+	}
+	for key := range want {
+		t.Errorf("production provider %q is not registered", key)
+	}
+}
+
+func TestMockIsLookupableButHidden(t *testing.T) {
+	e, err := Lookup(MockKey)
+	if err != nil {
+		t.Fatalf("Lookup(%q): %v", MockKey, err)
+	}
+	if !e.Hidden {
+		t.Error("mock registry entry must be hidden from production provider lists")
+	}
+	for _, production := range All() {
+		if production.Key == MockKey {
+			t.Error("mock appeared in the production provider list")
+		}
+	}
+	p, err := e.New(Deps{}, nil)
+	if err != nil {
+		t.Fatalf("build mock: %v", err)
+	}
+	if c := CapabilitiesOf(p); !c.Get || !c.Set || !c.Delete {
+		t.Errorf("mock is missing an interface required by semantic mutations: %+v", c)
 	}
 }
 
 func TestEveryProviderHasAtLeastOneRequiredCredential(t *testing.T) {
 	for _, e := range All() {
-		if e.Key == MockKey {
-			continue // the mock genuinely needs no credentials
-		}
 		hasRequired := false
 		for _, f := range e.Fields {
 			if f.Required {
@@ -87,11 +116,14 @@ func TestEveryProviderHasAtLeastOneRequiredCredential(t *testing.T) {
 }
 
 func TestCredentialsFromFormKeepsExistingSecretWhenBlank(t *testing.T) {
-	e, err := Lookup("cloudflare")
+	e, err := Lookup("hetzner")
 	if err != nil {
 		t.Fatal(err)
 	}
-	creds, err := e.CredentialsFromForm(map[string]string{"api_token": ""}, json.RawMessage(`{"api_token":"kept"}`))
+	creds, err := e.CredentialsFromForm(
+		map[string]string{"api_token": ""},
+		json.RawMessage(`{"api_token":"kept"}`),
+	)
 	if err != nil {
 		t.Fatalf("a blank secret with a stored value should be retained, not rejected: %v", err)
 	}
@@ -113,7 +145,9 @@ func TestRedactedHidesSecretsButNotPublicFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := e.Redacted(json.RawMessage(`{"access_key_id":"AKID","secret_access_key":"SEC","region":"us-east-1"}`))
+	got := e.Redacted(json.RawMessage(
+		`{"access_key_id":"AKID","secret_access_key":"SEC","region":"us-east-1"}`,
+	))
 	if strings.Contains(got["secret_access_key"], "SEC") || strings.Contains(got["access_key_id"], "AKID") {
 		t.Errorf("secrets leaked into the redacted view: %v", got)
 	}

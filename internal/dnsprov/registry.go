@@ -30,10 +30,12 @@ type Deps struct {
 
 // Entry is one supported DNS provider.
 type Entry struct {
-	Key    string
-	Label  string
-	DocURL string
-	Fields []Field
+	Key       string
+	Label     string
+	DocURL    string
+	SourceURL string
+	Fields    []Field
+	Hidden    bool
 	// New builds a libdns provider from the stored credentials blob. It returns `any` because each
 	// provider implements a different subset of the libdns interfaces; use Capabilities to see which.
 	New func(deps Deps, creds json.RawMessage) (any, error)
@@ -76,10 +78,13 @@ func Lookup(key string) (Entry, error) {
 	return e, nil
 }
 
-// All returns every provider, sorted by display label.
+// All returns the production providers available in the owner UI, sorted by display label.
 func All() []Entry {
 	out := make([]Entry, 0, len(registry))
 	for _, e := range registry {
+		if e.Hidden {
+			continue
+		}
 		out = append(out, e)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Label < out[j].Label })
@@ -104,7 +109,9 @@ func Build(deps Deps, providerKey string, creds json.RawMessage) (any, error) {
 //
 // A blank value for an already-stored secret means "leave it alone", so an owner can edit a
 // non-secret field without re-typing their API token; `existing` supplies the retained value.
-func (e Entry) CredentialsFromForm(values map[string]string, existing json.RawMessage) (json.RawMessage, error) {
+func (e Entry) CredentialsFromForm(
+	values map[string]string, existing json.RawMessage,
+) (json.RawMessage, error) {
 	prev := map[string]any{}
 	if len(existing) > 0 {
 		_ = json.Unmarshal(existing, &prev)

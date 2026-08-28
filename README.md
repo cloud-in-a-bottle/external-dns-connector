@@ -8,9 +8,9 @@ update exactly the records it needs, scoped by record name and type, without eve
 owner's registrar credentials. The owner-facing web UI configures providers and zones and can edit
 records by hand.
 
-Record operations go through [libdns](https://github.com/libdns/libdns). The bundled adapters are
-the exact module versions [pinned in `go.mod`](go.mod) and covered by this connector's conformance
-tests; support does not automatically extend to every provider in the upstream catalog.
+Record operations go through [libdns](https://github.com/libdns/libdns). Production support is
+limited to the exact adapter versions listed in [`docs/providers.md`](docs/providers.md), which are
+pinned in `go.mod` and covered by this connector's behavior tests.
 
 ## Using the service from another app
 
@@ -92,6 +92,9 @@ wrote cannot delete by exact value. Clearing a name that holds nothing succeeds 
 deleted, so it is safe to call in a `finally` or on a retry. Grants are checked on `(name, type)`
 either way.
 
+For an exact delete, matching uses name, type, and data. TTL is ignored because DNS stores one TTL
+for the entire RRset, not a separate TTL for each value.
+
 The full spec is in [`services/dns/openapi.yaml`](services/dns/openapi.yaml).
 
 ## Development
@@ -113,7 +116,7 @@ test dependencies and the playwright browser.
   same trust boundary as the app itself — anything that can read the database could equally read the
   process memory holding a decryption key — so this is stated plainly rather than dressed up.
   Switching to the OpenHost `secrets` service would move the boundary and is a reasonable change.
-- Reads are cached per zone for 30 seconds and invalidated on write, because provider APIs are
-  rate-limited (Cloudflare allows 1200 requests per 5 minutes; Route 53 five per second).
+- Reads are cached per zone for 30 seconds and invalidated on write because provider APIs are
+  rate-limited.
 - Writes to a zone are serialized, so two apps doing read-modify-write on the same zone cannot
   interleave.

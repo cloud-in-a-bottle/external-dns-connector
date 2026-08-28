@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/dnsprov"
 	"github.com/cloud-in-a-bottle/external-dns-connector/internal/store"
@@ -52,10 +53,18 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	all := dnsprov.All()
+	if len(all) == 0 {
+		http.Error(w, "no production DNS providers are registered", http.StatusInternalServerError)
+		return
+	}
 	selected := all[0]
 	if key := r.URL.Query().Get("provider"); key != "" {
-		if e, err := dnsprov.Lookup(key); err == nil {
-			selected = e
+		key = strings.ToLower(strings.TrimSpace(key))
+		for _, e := range all {
+			if e.Key == key {
+				selected = e
+				break
+			}
 		}
 	}
 
