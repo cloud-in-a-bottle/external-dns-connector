@@ -90,7 +90,11 @@ func scanAccount(sc scanner) (Account, error) {
 		return Account{}, err
 	}
 	a.Credentials = json.RawMessage(creds)
-	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	parsed, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return Account{}, fmt.Errorf("parse account %d created_at: %w", a.ID, err)
+	}
+	a.CreatedAt = parsed
 	return a, nil
 }
 

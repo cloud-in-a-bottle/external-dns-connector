@@ -114,7 +114,10 @@ func (s *Store) Zones() ([]Zone, error) {
 		if err := rows.Scan(&z.Zone, &z.AccountID, &z.Label, &z.Provider, &createdAt); err != nil {
 			return nil, err
 		}
-		z.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		z.CreatedAt, err = time.Parse(time.RFC3339, createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse zone %q created_at: %w", z.Zone, err)
+		}
 		out = append(out, z)
 	}
 	return out, rows.Err()
@@ -136,6 +139,10 @@ func (s *Store) Zone(name string) (Zone, error) {
 		}
 		return Zone{}, fmt.Errorf("read zone %q: %w", name, err)
 	}
-	z.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	parsed, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return Zone{}, fmt.Errorf("parse zone %q created_at: %w", z.Zone, err)
+	}
+	z.CreatedAt = parsed
 	return z, nil
 }

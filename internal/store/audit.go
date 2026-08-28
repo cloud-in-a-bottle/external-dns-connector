@@ -122,7 +122,10 @@ func (s *Store) AuditEntries(limit int) ([]AuditEntry, error) {
 		); err != nil {
 			return nil, err
 		}
-		e.TS, _ = time.Parse(time.RFC3339, ts)
+		e.TS, err = time.Parse(time.RFC3339, ts)
+		if err != nil {
+			return nil, fmt.Errorf("parse audit entry %d timestamp: %w", e.ID, err)
+		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
