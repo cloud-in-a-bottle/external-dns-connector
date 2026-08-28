@@ -11,6 +11,7 @@ dev = [
     "pytest-playwright",
     "playwright",
     "httpx>=0.27",
+    "requests>=2.32",
     # Builds the app's Dockerfile, runs it under podman with the mounts/env its cloudinabottle.toml
     # declares, and fronts it with the real OpenHost router (real subdomain routing and cookie auth).
     # Requires podman on the host.

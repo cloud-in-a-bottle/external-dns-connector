@@ -68,13 +68,15 @@ def test_record_changes_appear_in_the_activity_log(stack: OpenhostStack, zones: 
 
 def test_provider_credentials_are_never_rendered_back(stack: OpenhostStack, zones: list[str]) -> None:
     """A secret typed into the provider form must not come back out in any owner page."""
-    token = "super-secret-token-value"
+    label = "Hetzner credential secrecy check"
+    token = "synthetic-hetzner-api-token-for-secrecy-test"
     r = stack.owner_session.post(
         f"{stack.url}/accounts/add",
-        data={"provider": "cloudflare", "label": "cf-secrecy-check", "api_token": token},
+        data={"provider": "hetzner", "label": label, "api_token": token},
         timeout=30,
     )
     assert r.status_code == 200, r.text[:300]
+    assert f"<td>{label}</td>" in r.text, "the Hetzner account is not listed after being added"
 
     for path in ("/accounts", "/", "/audit"):
         body = stack.owner_session.get(f"{stack.url}{path}", timeout=30).text

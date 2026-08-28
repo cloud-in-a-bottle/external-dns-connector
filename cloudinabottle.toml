@@ -1,7 +1,7 @@
 [app]
 name = "external-dns-connector"
 version = "0.1.0"
-description = "Manage DNS records at external providers, and let other apps read and write them"
+description = "Manage Hetzner DNS records, and let other apps read and write them"
 
 [runtime.container]
 image = "Dockerfile"
@@ -19,8 +19,8 @@ endpoint = "/api/dns/"
 
 [resources]
 memory_mb = 512
-# The 20 bundled provider SDKs (AWS, Google Cloud, Alibaba) need more than the runtime footprint to compile.
-build_memory_mb = 4096
+# Hetzner is the only bundled provider, so 2 GiB is a safe compilation allowance.
+build_memory_mb = 2048
 cpu_cores = 0.5
 
 [data]

@@ -35,9 +35,8 @@
 
 ## gotchas worth remembering
 
-- libdns provider module versions have nothing to do with the libdns version they target
-  (`libdns/cloudflare` v0.2.2 requires libdns v1.1.0). several are `/v2` module paths. check
-  `go.mod` at the tag before bumping.
+- libdns provider module versions have nothing to do with the libdns version they target. Hetzner's
+  adapter uses the `github.com/libdns/hetzner/v2` module path; check its `go.mod` before bumping.
 - `libdns.RR.Parse()` can rewrite tuple fields: it derives A vs AAAA from the address family and adds
   service/transport underscores to some SRV names. `records.Wire.ToLibDNS` rejects any record whose
   normalized name or type changed during parsing; authorization covered the original tuple only.

@@ -1,16 +1,16 @@
 # external-dns-connector
 
-An OpenHost app that manages DNS records at external providers, and exposes them to other apps on
-the space through the OpenHost service interface.
+An OpenHost app that manages Hetzner DNS records and exposes them to other apps on the space through
+the OpenHost service interface.
 
 The point is the service API: an ACME solver, a dynamic-DNS updater, or a mail app can create and
 update exactly the records it needs, scoped by record name and type, without ever being handed the
-owner's registrar credentials. The owner-facing web UI configures providers and zones and can edit
-records by hand.
+owner's registrar credentials. The owner-facing web UI configures a Hetzner account and zones and can
+edit records by hand.
 
 Record operations go through [libdns](https://github.com/libdns/libdns). Production support is
-limited to the exact adapter versions listed in [`docs/providers.md`](docs/providers.md), which are
-pinned in `go.mod` and covered by this connector's behavior tests.
+limited to Hetzner at the exact adapter version listed in [`docs/providers.md`](docs/providers.md),
+which is pinned in `go.mod` and covered by this connector's behavior tests.
 
 ## Using the service from another app
 
