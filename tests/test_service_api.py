@@ -150,7 +150,9 @@ def test_delete_removes_the_record(acme_app: ServiceConsumer) -> None:
     assert got.body["results"][0]["records"] == []
 
 
-def test_zone_listing_needs_a_grant(stack: OpenhostStack, zones: list[str], acme_app: ServiceConsumer) -> None:
+def test_zone_listing_without_a_grant_is_empty(
+    stack: OpenhostStack, zones: list[str], acme_app: ServiceConsumer
+) -> None:
     granted = acme_app.call("zones", None)
     assert granted.status == 200, granted.body
     assert sorted(granted.body["zones"]) == sorted([ZONE_A, ZONE_B])
@@ -158,13 +160,15 @@ def test_zone_listing_needs_a_grant(stack: OpenhostStack, zones: list[str], acme
     ungranted = stack.deploy_service_consumer(
         SERVICE_URL, shortname="dns", version=">=0.1.0", name="consumer-nogrants"
     )
-    denied = ungranted.call("zones", None)
-    assert denied.status == 403, denied.body
+    empty = ungranted.call("zones", None)
+    assert empty.status == 200, empty.body
+    assert empty.body["zones"] == []
 
     # And the same app starts seeing zones once the owner grants it read access.
     stack.grant(ungranted.app_id, SERVICE_URL, READ_ALL_GRANT)
     allowed = ungranted.call("zones", None)
     assert allowed.status == 200, allowed.body
+    assert sorted(allowed.body["zones"]) == sorted([ZONE_A, ZONE_B])
 
 
 def test_clearing_an_rrset_needs_no_knowledge_of_its_contents(acme_app: ServiceConsumer) -> None:

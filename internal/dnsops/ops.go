@@ -31,6 +31,11 @@ type contextLock struct {
 	token chan struct{}
 }
 
+type zoneLockEntry struct {
+	lock *contextLock
+	refs int
+}
+
 func newContextLock() *contextLock {
 	l := &contextLock{token: make(chan struct{}, 1)}
 	l.token <- struct{}{}
@@ -78,7 +83,7 @@ type Ops struct {
 
 	configMu sync.Mutex
 	locksMu  sync.Mutex
-	locks    map[string]*contextLock
+	locks    map[string]*zoneLockEntry
 	cacheMu  sync.Mutex
 	cache    map[cacheKey]cacheEntry
 	nowFn    func() time.Time
@@ -105,7 +110,7 @@ func New(s *store.Store, options ...Option) *Ops {
 		buildProvider: func(acct store.Account) (any, error) {
 			return dnsprov.Build(deps, acct.Provider, acct.Credentials)
 		},
-		locks:   map[string]*contextLock{},
+		locks:   map[string]*zoneLockEntry{},
 		cache:   map[cacheKey]cacheEntry{},
 		nowFn:   time.Now,
 		timeout: lifecycle.ProviderTimeout,
@@ -156,15 +161,38 @@ func (o *Ops) provider(z store.Zone) (any, error) {
 	return o.buildProvider(acct)
 }
 
-func (o *Ops) zoneLock(zone string) *contextLock {
+func (o *Ops) acquireZoneLock(ctx context.Context, zone string) (func(), error) {
+	zone = records.NormalizeZone(zone)
+	o.locksMu.Lock()
+	entry := o.locks[zone]
+	if entry == nil {
+		entry = &zoneLockEntry{lock: newContextLock()}
+		o.locks[zone] = entry
+	}
+	entry.refs++
+	o.locksMu.Unlock()
+
+	if err := entry.lock.lock(ctx); err != nil {
+		o.dropZoneLockRef(zone, entry)
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			// Unlock first so deleting the last reference can never expose an overlapping lock.
+			entry.lock.unlock()
+			o.dropZoneLockRef(zone, entry)
+		})
+	}, nil
+}
+
+func (o *Ops) dropZoneLockRef(zone string, entry *zoneLockEntry) {
 	o.locksMu.Lock()
 	defer o.locksMu.Unlock()
-	if l, ok := o.locks[zone]; ok {
-		return l
+	entry.refs--
+	if entry.refs == 0 && o.locks[zone] == entry {
+		delete(o.locks, zone)
 	}
-	l := newContextLock()
-	o.locks[zone] = l
-	return l
 }
 
 // cached is called only while the corresponding zone lock is held. accountID keeps a stale entry
@@ -211,21 +239,24 @@ func (o *Ops) lockZones(ctx context.Context, zones []string) (func(), error) {
 	}
 	sort.Strings(names)
 
-	held := make([]*contextLock, 0, len(names))
+	held := make([]func(), 0, len(names))
 	for _, name := range names {
-		lock := o.zoneLock(name)
-		if err := lock.lock(ctx); err != nil {
+		release, err := o.acquireZoneLock(ctx, name)
+		if err != nil {
 			for i := len(held) - 1; i >= 0; i-- {
-				held[i].unlock()
+				held[i]()
 			}
 			return nil, err
 		}
-		held = append(held, lock)
+		held = append(held, release)
 	}
+	var once sync.Once
 	return func() {
-		for i := len(held) - 1; i >= 0; i-- {
-			held[i].unlock()
-		}
+		once.Do(func() {
+			for i := len(held) - 1; i >= 0; i-- {
+				held[i]()
+			}
+		})
 	}, nil
 }
 
@@ -351,11 +382,11 @@ func (o *Ops) DeleteAccount(ctx context.Context, id int64) error {
 // Get returns every record in a zone, from cache when fresh.
 func (o *Ops) Get(ctx context.Context, z store.Zone) ([]libdns.Record, error) {
 	zone := records.NormalizeZone(z.Zone)
-	lock := o.zoneLock(zone)
-	if err := lock.lock(ctx); err != nil {
+	unlock, err := o.acquireZoneLock(ctx, zone)
+	if err != nil {
 		return nil, err
 	}
-	defer lock.unlock()
+	defer unlock()
 
 	current, err := o.store.Zone(zone)
 	if err != nil {
@@ -416,11 +447,11 @@ func (o *Ops) mutate(
 	ctx context.Context, z store.Zone, op WriteOp, recs []libdns.Record, clears []records.RRset,
 ) ([]libdns.Record, error) {
 	zone := records.NormalizeZone(z.Zone)
-	lock := o.zoneLock(zone)
-	if err := lock.lock(ctx); err != nil {
+	unlock, err := o.acquireZoneLock(ctx, zone)
+	if err != nil {
 		return nil, err
 	}
-	defer lock.unlock()
+	defer unlock()
 
 	current, err := o.store.Zone(zone)
 	if err != nil {

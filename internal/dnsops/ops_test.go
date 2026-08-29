@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -94,6 +95,11 @@ func (c *observedContext) Done() <-chan struct{} {
 
 type operationResult struct {
 	records []libdns.Record
+	err     error
+}
+
+type zoneLockResult struct {
+	release func()
 	err     error
 }
 
@@ -353,6 +359,79 @@ func TestBlockedWriteCompletesBeforeRebindAndNextWriteUsesNewProvider(t *testing
 	}
 }
 
+func TestSameZoneLocksAreMutuallyExclusive(t *testing.T) {
+	ops := New(newOpsTestStore(t))
+	firstRelease, err := ops.acquireZoneLock(t.Context(), "Example.com.")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitObserved := make(chan struct{})
+	waitCtx := &observedContext{Context: t.Context(), observed: waitObserved}
+	secondDone := make(chan zoneLockResult, 1)
+	go func() {
+		release, err := ops.acquireZoneLock(waitCtx, "example.com")
+		secondDone <- zoneLockResult{release: release, err: err}
+	}()
+	waitClosed(t, waitObserved)
+	assertZoneLockRefs(t, ops, "example.com", 2)
+	assertPending(t, secondDone)
+
+	firstRelease()
+	firstRelease()
+	second := receive(t, secondDone)
+	if second.err != nil {
+		t.Fatal(second.err)
+	}
+	assertZoneLockRefs(t, ops, "example.com", 1)
+	second.release()
+	assertNoZoneLocks(t, ops)
+}
+
+func TestCanceledZoneLockWaiterCleansUp(t *testing.T) {
+	ops := New(newOpsTestStore(t))
+	heldRelease, err := ops.acquireZoneLock(t.Context(), "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitObserved := make(chan struct{})
+	baseCtx, cancel := context.WithCancel(t.Context())
+	waitCtx := &observedContext{Context: baseCtx, observed: waitObserved}
+	waitDone := make(chan zoneLockResult, 1)
+	go func() {
+		release, err := ops.acquireZoneLock(waitCtx, "example.com")
+		waitDone <- zoneLockResult{release: release, err: err}
+	}()
+	waitClosed(t, waitObserved)
+	assertZoneLockRefs(t, ops, "example.com", 2)
+	cancel()
+	waiter := receive(t, waitDone)
+	if !errors.Is(waiter.err, context.Canceled) {
+		t.Fatalf("waiting lock returned %v, want context cancellation", waiter.err)
+	}
+	if waiter.release != nil {
+		t.Fatal("canceled lock acquisition returned a release function")
+	}
+	assertZoneLockRefs(t, ops, "example.com", 1)
+
+	heldRelease()
+	assertNoZoneLocks(t, ops)
+}
+
+func TestZoneLockRegistryDoesNotRetainIdleZones(t *testing.T) {
+	ops := New(newOpsTestStore(t))
+	for i := range 5000 {
+		zone := "zone-" + strconv.Itoa(i) + ".example"
+		release, err := ops.acquireZoneLock(t.Context(), zone)
+		if err != nil {
+			t.Fatal(err)
+		}
+		release()
+	}
+	assertNoZoneLocks(t, ops)
+}
+
 func TestZoneLockAcquisitionHonorsContext(t *testing.T) {
 	st := newOpsTestStore(t)
 	accountID := newOpsTestAccount(t, st, "provider", "account")
@@ -394,6 +473,7 @@ func TestZoneLockAcquisitionHonorsContext(t *testing.T) {
 	if err := receive(t, firstDone); err != nil {
 		t.Fatal(err)
 	}
+	assertNoZoneLocks(t, ops)
 }
 
 type deadlineProvider struct {
@@ -545,6 +625,28 @@ func assertZoneAccount(t *testing.T, st *store.Store, zone string, want int64) {
 	}
 	if got.AccountID != want {
 		t.Fatalf("zone %s account = %d, want %d", zone, got.AccountID, want)
+	}
+}
+
+func assertZoneLockRefs(t *testing.T, ops *Ops, zone string, want int) {
+	t.Helper()
+	ops.locksMu.Lock()
+	defer ops.locksMu.Unlock()
+	entry := ops.locks[zone]
+	if entry == nil {
+		t.Fatalf("zone lock %q is missing", zone)
+	}
+	if entry.refs != want {
+		t.Fatalf("zone lock %q refs = %d, want %d", zone, entry.refs, want)
+	}
+}
+
+func assertNoZoneLocks(t *testing.T, ops *Ops) {
+	t.Helper()
+	ops.locksMu.Lock()
+	defer ops.locksMu.Unlock()
+	if len(ops.locks) != 0 {
+		t.Fatalf("zone lock registry contains %d idle entries", len(ops.locks))
 	}
 }
 
