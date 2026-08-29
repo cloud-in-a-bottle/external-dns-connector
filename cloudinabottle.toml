@@ -1,0 +1,27 @@
+[app]
+name = "external-dns-connector"
+version = "0.1.0"
+description = "Manage Hetzner DNS records, and let other apps read and write them"
+
+[runtime.container]
+image = "Dockerfile"
+port = 8080
+
+[routing]
+health_check = "/health"
+# No public paths. The owner UI is gated by the router's login; the service API is reachable only
+# through the router's service proxy, which supplies the calling app's identity and grants.
+
+[[services.v2.provides]]
+service = "github.com/cloud-in-a-bottle/external-dns-connector/services/dns"
+version = "0.1.0"
+endpoint = "/api/dns/"
+
+[resources]
+memory_mb = 512
+# Hetzner is the only bundled provider, so 2 GiB is a safe compilation allowance.
+build_memory_mb = 2048
+cpu_cores = 0.5
+
+[data]
+sqlite = ["main"]

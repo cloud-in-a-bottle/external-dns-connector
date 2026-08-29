@@ -1,0 +1,67 @@
+{{define "content"}}
+<h2 class="mono">{{.Zone.Zone}}</h2>
+<p class="sub">{{.Zone.Label}} <span class="tag">{{.Zone.Provider}}</span> · <a href="/">all zones</a></p>
+
+<div class="panel">
+  {{if .Records}}
+  <table>
+    <thead><tr><th>Name</th><th>Type</th><th>TTL</th><th>Value</th><th></th></tr></thead>
+    <tbody>
+    {{range .Records}}
+      <tr>
+        <td class="mono">{{.Name}}</td>
+        <td class="mono">{{.Type}}</td>
+        <td class="mono">{{.TTL}}</td>
+        <td class="mono">{{.Data}}</td>
+        <td style="text-align:right">
+          {{if .Writable}}
+          <form method="post" action="/zones/{{$.Zone.Zone}}/delete" style="display:inline"
+                onsubmit="return confirm('Delete {{.Name}} {{.Type}} {{.Data}}?')">
+            <input type="hidden" name="name" value="{{.Name}}">
+            <input type="hidden" name="type" value="{{.Type}}">
+            <input type="hidden" name="ttl" value="{{.TTL}}">
+            <input type="hidden" name="data" value="{{.Data}}">
+            <button class="ghost" type="submit">Delete</button>
+          </form>
+          {{else}}
+            <span class="tag" title="This connector only writes {{$.WritableTypes}}">read-only</span>
+          {{end}}
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+    <div class="empty">This zone has no records, or the provider returned none.</div>
+  {{end}}
+</div>
+
+<h3>Add a record</h3>
+<div class="panel">
+  <form method="post" action="/zones/{{.Zone.Zone}}/add">
+    <div class="row">
+      <div class="field">
+        <label for="name">Name</label>
+        <input id="name" name="name" placeholder="www" required>
+        <div class="help">Relative to the zone. Use <code>@</code> for {{.Zone.Zone}} itself.</div>
+      </div>
+      <div class="field narrow">
+        <label for="type">Type</label>
+        <select id="type" name="type">{{range .Types}}<option>{{.}}</option>{{end}}</select>
+      </div>
+      <div class="field narrow">
+        <label for="ttl">TTL</label>
+        <input id="ttl" name="ttl" value="300" inputmode="numeric">
+      </div>
+      <div class="field" style="flex:2 1 260px">
+        <label for="data">Value</label>
+        <input id="data" name="data" placeholder="192.0.2.1" required>
+      </div>
+      <div class="field narrow"><button type="submit">Add</button></div>
+    </div>
+    <p class="sub" style="margin:2px 0 0">
+      Adds to the existing records with this name and type rather than replacing them.
+    </p>
+  </form>
+</div>
+{{end}}

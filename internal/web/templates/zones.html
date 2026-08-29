@@ -1,0 +1,60 @@
+{{define "content"}}
+<h2>Zones</h2>
+<p class="sub">The DNS zones this connector manages. Apps can only address zones in this list — it is
+owner-only configuration and no permission grant can change it.</p>
+
+{{if not .Accounts}}
+  <div class="panel">
+    <div class="empty">No DNS provider is configured yet. <a href="/accounts">Add one</a> before adding zones.</div>
+  </div>
+{{else}}
+  <div class="panel">
+    {{if .Zones}}
+    <table>
+      <thead><tr><th>Zone</th><th>Provider account</th><th>Records</th><th></th></tr></thead>
+      <tbody>
+      {{range .Zones}}
+        <tr>
+          <td class="mono">{{.Zone}}</td>
+          <td>{{.Label}} <span class="tag">{{.Provider}}</span></td>
+          <td><a href="/zones/{{.Zone}}">Browse &amp; edit</a></td>
+          <td style="text-align:right">
+            <form method="post" action="/zones/delete" style="display:inline">
+              <input type="hidden" name="zone" value="{{.Zone}}">
+              <button class="ghost" type="submit">Remove</button>
+            </form>
+          </td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+      <div class="empty">No zones configured yet.</div>
+    {{end}}
+  </div>
+
+  <h3>Add a zone</h3>
+  <div class="panel">
+    <form method="post" action="/zones/add">
+      <div class="row">
+        <div class="field" style="flex:2 1 240px">
+          <label for="zone">Zone name</label>
+          <input id="zone" name="zone" placeholder="example.com" required>
+        </div>
+        <div class="field">
+          <label for="account_id">Provider account</label>
+          <select id="account_id" name="account_id">
+            {{range .Accounts}}<option value="{{.ID}}">{{.Label}} ({{.Provider}})</option>{{end}}
+          </select>
+        </div>
+        <div class="field narrow"><button type="submit">Add zone</button></div>
+      </div>
+    </form>
+    {{if .Discoverable}}
+      <p class="sub" style="margin:6px 0 0">
+        Zones visible to your providers: {{range $i, $z := .Discoverable}}{{if $i}}, {{end}}<code>{{$z}}</code>{{end}}
+      </p>
+    {{end}}
+  </div>
+{{end}}
+{{end}}
