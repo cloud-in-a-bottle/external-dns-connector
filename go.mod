@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/getkin/kin-openapi v0.149.0
-	github.com/libdns/hetzner/v2 v2.0.1
+	github.com/hetznercloud/hcloud-go/v2 v2.27.0
 	github.com/libdns/libdns v1.1.1
 	modernc.org/sqlite v1.57.0
 )
@@ -16,7 +16,6 @@ require (
 	github.com/go-openapi/jsonpointer v0.22.5 // indirect
 	github.com/go-openapi/swag/jsonname v0.25.5 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/hetznercloud/hcloud-go/v2 v2.27.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect

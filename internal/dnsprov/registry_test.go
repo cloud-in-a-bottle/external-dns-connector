@@ -54,17 +54,28 @@ func TestProductionProvidersArePinnedAndImplementSemanticInterfaces(t *testing.T
 	if e.Key != "hetzner" {
 		t.Fatalf("production provider = %q, want hetzner", e.Key)
 	}
-	wantSource := "https://github.com/libdns/hetzner/blob/" +
-		"36dd896cea1474c0cbb7a6a9bf6dbc0f14a0c178/provider.go"
+	wantSource := "https://github.com/hetznercloud/hcloud-go/blob/" +
+		"7a591b7c57103f451f85e797f8818b38f0c3d1aa/hcloud/zone_rrset.go"
 	if e.SourceURL != wantSource {
 		t.Errorf("source URL = %q, want exact pinned source %q", e.SourceURL, wantSource)
 	}
-	p, err := e.New(Deps{}, nil)
+	p, err := e.New(Deps{}, json.RawMessage(`{"api_token":"test-token"}`))
 	if err != nil {
-		t.Fatalf("New(nil): %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if c := CapabilitiesOf(p); !c.Get || !c.Append || !c.Set || !c.Delete {
+	if c := CapabilitiesOf(p); !c.Get || !c.Append || !c.Set || !c.Delete || !c.List {
 		t.Errorf("Hetzner is missing an interface required by semantic mutations: %+v", c)
+	}
+}
+
+func TestBuildHetznerRejectsMissingToken(t *testing.T) {
+	for _, credentials := range []json.RawMessage{nil, json.RawMessage(`{}`), json.RawMessage(
+		`{"api_token":"  "}`,
+	)} {
+		_, err := Build(Deps{}, "hetzner", credentials)
+		if err == nil || !strings.Contains(err.Error(), "API token is required") {
+			t.Errorf("Build with credentials %s returned %v, want an explicit token error", credentials, err)
+		}
 	}
 }
 

@@ -3,9 +3,12 @@ package dns_test
 import (
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
+
+	"github.com/cloud-in-a-bottle/external-dns-connector/internal/records"
 )
 
 const jsonContentType = "application/json"
@@ -185,10 +188,10 @@ func TestReadAndMutationRecordTypes(t *testing.T) {
 
 func TestWriteRecordTTLContract(t *testing.T) {
 	schema := componentSchema(t, loadDocument(t), "WriteRecord")
-	for _, ttl := range []int64{1, 4294967295} {
+	for _, ttl := range []int64{records.MinTTLSeconds, records.MaxTTLSeconds} {
 		assertAccepts(t, schema, contractRecord{Name: "www", Type: "A", TTL: ttl, Data: "192.0.2.1"})
 	}
-	for _, ttl := range []int64{-1, 0, 4294967296} {
+	for _, ttl := range []int64{-1, 0, 1, 59, records.MaxTTLSeconds + 1} {
 		assertRejects(t, schema, contractRecord{Name: "www", Type: "A", TTL: ttl, Data: "192.0.2.1"})
 	}
 	assertRejects(t, schema, contractRecordWithoutTTL{Name: "www", Type: "A", Data: "192.0.2.1"})
@@ -201,6 +204,18 @@ func TestWriteRecordTTLContract(t *testing.T) {
 	assertRejects(t, schema, contractRecordWithFloatTTL{
 		Name: "www", Type: "A", TTL: 1.5, Data: "192.0.2.1",
 	})
+}
+
+func TestWriteRRsetMemberLimitIsDocumented(t *testing.T) {
+	doc := loadDocument(t)
+	writeBody := doc.Components.RequestBodies["Write"].Value
+	schema := writeBody.Content.Get(jsonContentType).Schema.Value
+	recordList := propertySchema(t, schema, "records")
+	if !strings.Contains(recordList.Description, "50 distinct values") ||
+		!strings.Contains(recordList.Description, "Existing values") {
+		t.Fatalf("write records description does not explain the RRset limit: %q",
+			recordList.Description)
+	}
 }
 
 func TestDeleteTargetDataContract(t *testing.T) {
@@ -222,12 +237,12 @@ func TestDeleteTargetDataContract(t *testing.T) {
 func TestDeleteTargetTTLContract(t *testing.T) {
 	schema := componentSchema(t, loadDocument(t), "DeleteTarget")
 	assertAccepts(t, schema, contractDeleteTarget{Name: "_acme-challenge", Type: "TXT"})
-	for _, ttl := range []int64{1, 4294967295} {
+	for _, ttl := range []int64{records.MinTTLSeconds, records.MaxTTLSeconds} {
 		assertAccepts(t, schema, contractExactDeleteTarget{
 			Name: "_acme-challenge", Type: "TXT", TTL: ttl, Data: stringPointer("token"),
 		})
 	}
-	for _, ttl := range []int64{-1, 0, 4294967296} {
+	for _, ttl := range []int64{-1, 0, 1, 59, records.MaxTTLSeconds + 1} {
 		assertRejects(t, schema, contractExactDeleteTarget{
 			Name: "_acme-challenge", Type: "TXT", TTL: ttl, Data: stringPointer("token"),
 		})

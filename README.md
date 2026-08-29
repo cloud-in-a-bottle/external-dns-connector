@@ -8,9 +8,9 @@ update exactly the records it needs, scoped by record name and type, without eve
 owner's registrar credentials. The owner-facing web UI configures a Hetzner account and zones and can
 edit records by hand.
 
-Record operations go through [libdns](https://github.com/libdns/libdns). Production support is
-limited to Hetzner at the exact adapter version listed in [`docs/providers.md`](docs/providers.md),
-which is pinned in `go.mod` and covered by this connector's behavior tests.
+Record operations use [libdns](https://github.com/libdns/libdns) interfaces and types. Production
+support is limited to the local Hetzner adapter and exact hcloud API client version listed in
+[`docs/providers.md`](docs/providers.md), which is pinned in `go.mod` and covered by behavior tests.
 
 ## Using the service from another app
 
@@ -70,6 +70,8 @@ every zone succeeded, `207` when some did, `502` when none did.
 Provider APIs are not transactionally atomic across RRsets. If one zone request changes multiple
 RRsets and a later RRset fails, earlier changes remain applied. A failed zone result may therefore
 contain `records` that were successfully applied before its `error`; callers should inspect both.
+If Set replaced values but its separate TTL change failed, those records carry the prior effective
+TTL. They are omitted when that TTL is not known.
 
 ### Records
 
@@ -80,8 +82,11 @@ One flat shape covers every type, mirroring a zone file line:
 ```
 
 `name` is relative to the zone — `www`, not `www.example.com`. Set and append require an integer
-`ttl` from 1 through 4294967295 seconds. `data` is unescaped zone-file RDATA, so `MX` is
+`ttl` from 60 through 2147483647 seconds. `data` is unescaped zone-file RDATA, so `MX` is
 `"10 mail.example.com."` and `SRV` is `"10 5 443 host.example.com."`.
+
+Set and append allow at most 50 distinct values in any one `(name, type)` RRset. For append, existing
+values count toward that limit.
 
 Writable types: `A`, `AAAA`, `CAA`, `CNAME`, `MX`, `NS`, `SRV`, `TXT` — the basics plus what email
 needs. Reads pass through whatever the provider returns.
@@ -102,7 +107,7 @@ either way.
 
 For an exact delete, matching uses name, type, and data. TTL is ignored because DNS stores one TTL
 for the entire RRset, not a separate TTL for each value. It may be omitted, but when present it must
-still be an integer from 1 through 4294967295. To clear an RRset, omit `data` entirely; explicitly
+still be an integer from 60 through 2147483647. To clear an RRset, omit `data` entirely; explicitly
 blank or null `data` is rejected.
 
 The full spec is in [`services/dns/openapi.yaml`](services/dns/openapi.yaml).

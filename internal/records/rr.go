@@ -9,8 +9,10 @@ import (
 )
 
 const (
-	MinTTLSeconds int64 = 1
-	MaxTTLSeconds int64 = 1<<32 - 1
+	MinTTLSeconds int64 = 60
+	MaxTTLSeconds int64 = 1<<31 - 1
+	// MaxRRSetMembers is Hetzner's maximum number of values sharing a name and type.
+	MaxRRSetMembers = 50
 )
 
 // Wire is the record shape the service API and the owner UI both speak. It maps one-to-one onto

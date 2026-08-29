@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,15 +29,16 @@ type mutationCall struct {
 }
 
 type mutationProvider struct {
-	records     []libdns.Record
-	getCalls    []string
-	setCalls    []mutationCall
-	appendCalls []mutationCall
-	deleteCalls []mutationCall
-	setErr      error
-	setErrCall  int
-	appendErr   error
-	deleteErr   error
+	records      []libdns.Record
+	getCalls     []string
+	setCalls     []mutationCall
+	appendCalls  []mutationCall
+	deleteCalls  []mutationCall
+	setErr       error
+	setErrCall   int
+	setErrResult []libdns.Record
+	appendErr    error
+	deleteErr    error
 }
 
 func (p *mutationProvider) GetRecords(_ context.Context, zone string) ([]libdns.Record, error) {
@@ -60,7 +62,7 @@ func (p *mutationProvider) SetRecords(
 ) ([]libdns.Record, error) {
 	p.setCalls = append(p.setCalls, mutationCall{zone: zone, records: copyRecords(recs)})
 	if p.setErr != nil && (p.setErrCall == 0 || len(p.setCalls) == p.setErrCall) {
-		return nil, p.setErr
+		return copyRecords(p.setErrResult), p.setErr
 	}
 	touched := map[rrsetKey]bool{}
 	for _, rec := range recs {
@@ -95,6 +97,22 @@ func (p *mutationProvider) DeleteRecords(
 	}
 	p.records = next
 	return misleadingProviderResult(), nil
+}
+
+type exactMutationProvider struct {
+	*mutationProvider
+	exactDeleteCalls []mutationCall
+}
+
+func (p *exactMutationProvider) DeleteRecordsExact(
+	ctx context.Context,
+	zone string,
+	recs []libdns.Record,
+) ([]libdns.Record, error) {
+	p.exactDeleteCalls = append(p.exactDeleteCalls, mutationCall{
+		zone: zone, records: copyRecords(recs),
+	})
+	return p.mutationProvider.DeleteRecords(ctx, zone, recs)
 }
 
 func misleadingProviderResult() []libdns.Record {
@@ -173,6 +191,25 @@ func TestExactDeleteIgnoresTTLAndPreservesSiblingValues(t *testing.T) {
 	}
 }
 
+func TestSemanticDeleteUsesProviderExactFastPath(t *testing.T) {
+	target := testRR("name", "TXT", "drop", 60)
+	p := &exactMutationProvider{mutationProvider: &mutationProvider{
+		records: []libdns.Record{target},
+	}}
+
+	got, err := runMutation(t, p, OpDelete, []libdns.Record{
+		testRR("name", "TXT", "drop", 999),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRecords(t, got, []libdns.Record{target})
+	if len(p.exactDeleteCalls) != 1 {
+		t.Fatalf("exact delete calls = %d, want 1", len(p.exactDeleteCalls))
+	}
+	assertMutationCall(t, p.exactDeleteCalls[0], []libdns.Record{target})
+}
+
 func TestClearDeletesTheFreshCurrentRRset(t *testing.T) {
 	one := testRR("name", "TXT", "one", 60)
 	two := testRR("name", "TXT", "two", 60)
@@ -235,6 +272,91 @@ func TestAppendRejectsConflictingRRsetTTLsBeforeWriting(t *testing.T) {
 		t.Fatalf("expected a conflicting TTL error, got %v", err)
 	}
 	assertRecords(t, p.records, []libdns.Record{existing})
+	assertProviderCalls(t, p, 1, 0, 0, 0)
+}
+
+func TestRRsetMemberLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		op        WriteOp
+		current   []libdns.Record
+		requested []libdns.Record
+		wantError bool
+	}{
+		{
+			name:      "set accepts fifty",
+			op:        OpSet,
+			requested: numberedRecords("set", records.MaxRRSetMembers),
+		},
+		{
+			name:      "set rejects fifty one",
+			op:        OpSet,
+			requested: numberedRecords("set", records.MaxRRSetMembers+1),
+			wantError: true,
+		},
+		{
+			name:      "append accepts total fifty",
+			op:        OpAppend,
+			current:   numberedRecords("append", records.MaxRRSetMembers-1),
+			requested: []libdns.Record{testRR("append", "TXT", "new", 60)},
+		},
+		{
+			name:    "append rejects total fifty one",
+			op:      OpAppend,
+			current: numberedRecords("append", records.MaxRRSetMembers-1),
+			requested: []libdns.Record{
+				testRR("append", "TXT", "new-one", 60),
+				testRR("append", "TXT", "new-two", 60),
+			},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := planRRsets(tt.op, tt.current, tt.requested, nil)
+			if tt.wantError && (err == nil || !strings.Contains(err.Error(), "at most 50")) {
+				t.Fatalf("planRRsets returned %v, want member-limit error", err)
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("planRRsets returned %v", err)
+			}
+		})
+	}
+}
+
+func TestOversizedRequestedRRsetFailsBeforeProviderRead(t *testing.T) {
+	for _, op := range []WriteOp{OpSet, OpAppend} {
+		t.Run(string(op), func(t *testing.T) {
+			p := &mutationProvider{}
+			_, err := runMutation(
+				t,
+				p,
+				op,
+				numberedRecords("oversized", records.MaxRRSetMembers+1),
+				nil,
+			)
+			if err == nil || !strings.Contains(err.Error(), "at most 50") {
+				t.Fatalf("mutation returned %v, want member-limit error", err)
+			}
+			assertProviderCalls(t, p, 0, 0, 0, 0)
+		})
+	}
+}
+
+func TestAppendMemberLimitAccountsForCurrentRRsetBeforeMutation(t *testing.T) {
+	p := &mutationProvider{
+		records: numberedRecords("append", records.MaxRRSetMembers-1),
+	}
+	requested := []libdns.Record{
+		testRR("append", "TXT", "new-one", 60),
+		testRR("append", "TXT", "new-two", 60),
+	}
+
+	_, err := runMutation(t, p, OpAppend, requested, nil)
+	if err == nil || !strings.Contains(err.Error(), "at most 50") {
+		t.Fatalf("append returned %v, want member-limit error", err)
+	}
 	assertProviderCalls(t, p, 1, 0, 0, 0)
 }
 
@@ -323,6 +445,26 @@ func TestMutationReturnsAppliedRRsetsWhenLaterRRsetFails(t *testing.T) {
 	assertProviderCalls(t, p, 1, 2, 0, 0)
 	assertMutationCall(t, p.setCalls[0], []libdns.Record{first})
 	assertMutationCall(t, p.setCalls[1], []libdns.Record{second})
+}
+
+func TestMutationIncludesOnlyCurrentPlanProviderResultOnError(t *testing.T) {
+	first := testRR("a", "TXT", "applied", 60)
+	second := testRR("b", "TXT", "values-applied-before-ttl-failed", 300)
+	secondAtOldTTL := testRR("b", "TXT", "values-applied-before-ttl-failed", 60)
+	unrelated := testRR("outside", "TXT", "must-not-leak-into-result", 60)
+	failure := errors.New("TTL change failed")
+	p := &mutationProvider{
+		setErr:       failure,
+		setErrCall:   2,
+		setErrResult: []libdns.Record{secondAtOldTTL, unrelated},
+	}
+
+	got, err := runMutation(t, p, OpSet, []libdns.Record{second, first}, nil)
+	if !errors.Is(err, failure) {
+		t.Fatalf("set returned %v, want %v", err, failure)
+	}
+	assertRecords(t, got, []libdns.Record{first, secondAtOldTTL})
+	assertProviderCalls(t, p, 1, 2, 0, 0)
 }
 
 func TestExactDeleteErrorLeavesExistingSiblingRecordsUntouched(t *testing.T) {
@@ -435,6 +577,14 @@ func testRR(name, rrtype, data string, ttlSeconds int) libdns.Record {
 		TTL:  time.Duration(ttlSeconds) * time.Second,
 		Data: data,
 	}
+}
+
+func numberedRecords(name string, count int) []libdns.Record {
+	records := make([]libdns.Record, 0, count)
+	for i := range count {
+		records = append(records, testRR(name, "TXT", "value-"+strconv.Itoa(i), 60))
+	}
+	return records
 }
 
 func assertProviderCalls(

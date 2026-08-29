@@ -25,6 +25,10 @@ type rrsetPlan struct {
 	changed bool
 }
 
+type exactRecordDeleter interface {
+	DeleteRecordsExact(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error)
+}
+
 // applySemanticMutation performs the provider-independent read-modify-write while its caller holds
 // the zone lock. Existing records stay in their provider-specific types when an RRset is preserved.
 func applySemanticMutation(
@@ -37,6 +41,9 @@ func applySemanticMutation(
 ) ([]libdns.Record, error) {
 	if op != OpSet && op != OpAppend && op != OpDelete {
 		return nil, fmt.Errorf("unknown write operation %q", op)
+	}
+	if err := preflightRRsetSizes(op, requested); err != nil {
+		return nil, err
 	}
 	current, err := fetch(ctx, p, z)
 	if err != nil {
@@ -82,16 +89,24 @@ func applySemanticMutation(
 			result = append(result, plan.result...)
 			continue
 		}
-		var err error
+		var (
+			providerResult []libdns.Record
+			err            error
+		)
 		switch op {
 		case OpSet:
-			_, err = setter.SetRecords(ctx, fqdn, plan.records)
+			providerResult, err = setter.SetRecords(ctx, fqdn, plan.records)
 		case OpAppend:
-			_, err = appender.AppendRecords(ctx, fqdn, plan.records)
+			providerResult, err = appender.AppendRecords(ctx, fqdn, plan.records)
 		case OpDelete:
-			_, err = deleter.DeleteRecords(ctx, fqdn, plan.records)
+			if exact, ok := p.(exactRecordDeleter); ok {
+				providerResult, err = exact.DeleteRecordsExact(ctx, fqdn, plan.records)
+			} else {
+				providerResult, err = deleter.DeleteRecords(ctx, fqdn, plan.records)
+			}
 		}
 		if err != nil {
+			result = append(result, recordsForPlan(providerResult, plan.key)...)
 			return result, fmt.Errorf("%s RRset %s/%s: %w", op, plan.key.name, plan.key.rrtype, err)
 		}
 		result = append(result, plan.result...)
@@ -154,6 +169,9 @@ func planRRsets(
 				return nil, err
 			}
 			plan.records = uniqueValues(requestSet)
+			if err := requireRRsetSize(key, len(plan.records)); err != nil {
+				return nil, err
+			}
 			plan.result = copyRecords(plan.records)
 			plan.changed = !sameRRset(currentSet, plan.records)
 
@@ -170,6 +188,9 @@ func planRRsets(
 				}
 				seen[rec.RR().Data] = true
 				plan.records = append(plan.records, rec)
+			}
+			if err := requireRRsetSize(key, len(seen)); err != nil {
+				return nil, err
 			}
 			plan.result = copyRecords(plan.records)
 			plan.changed = len(plan.records) > 0
@@ -275,6 +296,47 @@ func requireSharedTTL(key rrsetKey, recs []libdns.Record) error {
 	return nil
 }
 
+func preflightRRsetSizes(op WriteOp, recs []libdns.Record) error {
+	if op != OpSet && op != OpAppend {
+		return nil
+	}
+	values := make(map[rrsetKey]map[string]bool)
+	for _, rec := range recs {
+		key := keyForRecord(rec)
+		if values[key] == nil {
+			values[key] = make(map[string]bool)
+		}
+		values[key][rec.RR().Data] = true
+		if err := requireRRsetSize(key, len(values[key])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requireRRsetSize(key rrsetKey, count int) error {
+	if count <= records.MaxRRSetMembers {
+		return nil
+	}
+	return fmt.Errorf(
+		"RRset %s/%s has %d members; Hetzner allows at most %d",
+		key.name,
+		key.rrtype,
+		count,
+		records.MaxRRSetMembers,
+	)
+}
+
 func copyRecords(recs []libdns.Record) []libdns.Record {
 	return append([]libdns.Record(nil), recs...)
+}
+
+func recordsForPlan(recs []libdns.Record, key rrsetKey) []libdns.Record {
+	var result []libdns.Record
+	for _, rec := range recs {
+		if rec != nil && keyForRecord(rec) == key {
+			result = append(result, rec)
+		}
+	}
+	return result
 }

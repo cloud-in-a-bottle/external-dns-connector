@@ -35,8 +35,8 @@
 
 ## gotchas worth remembering
 
-- libdns provider module versions have nothing to do with the libdns version they target. Hetzner's
-  adapter uses the `github.com/libdns/hetzner/v2` module path; check its `go.mod` before bumping.
+- Hetzner's semantic adapter is local and directly pins `github.com/hetznercloud/hcloud-go/v2`; its
+  DNS API is marked experimental upstream, so review its zone and RRset API changes before bumping.
 - `libdns.RR.Parse()` can rewrite tuple fields: it derives A vs AAAA from the address family and adds
   service/transport underscores to some SRV names. `records.Wire.ToLibDNS` rejects any record whose
   normalized name or type changed during parsing; authorization covered the original tuple only.

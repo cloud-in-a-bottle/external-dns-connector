@@ -60,11 +60,14 @@ info:
 
     `name` is relative to the zone — `www`, not `www.example.com`; a name that already includes the
     zone is rejected rather than silently written as `www.example.com.example.com`. Set and append
-    require an integer `ttl` from 1 through 4294967295 seconds. `data` is unescaped zone-file RDATA,
+    require an integer `ttl` from 60 through 2147483647 seconds. `data` is unescaped zone-file RDATA,
     so `MX` is `"10 mail.example.com."` and `SRV` is `"10 5 443 host.example.com."`.
 
     Writable types are `A`, `AAAA`, `CAA`, `CNAME`, `MX`, `NS`, `SRV`, and `TXT`. Reads return
     whatever the provider reports, including types outside that list.
+
+    Set and append permit at most 50 distinct values in one `(name, type)` RRset. Existing values
+    count toward that limit for append.
 
     ## Zones
 
@@ -167,7 +170,7 @@ paths:
         `ttl` never participates in exact matching because DNS stores one TTL for the whole RRset,
         not one per value. A record given **without** `data` clears the whole `(name, type)` RRset,
         removing whatever it currently holds. `ttl` may be omitted in either form, but if present it
-        must be a non-null integer from 1 through 4294967295. Explicitly blank or null `data` is
+        must be a non-null integer from 60 through 2147483647. Explicitly blank or null `data` is
         invalid.
 
         The second form is what an unconditional cleanup path needs: a process that died before
@@ -233,6 +236,9 @@ components:
               records:
                 type: array
                 minItems: 1
+                description: |
+                  Each `(name, type)` RRset may contain at most 50 distinct values after the
+                  operation. Existing values count toward the limit for append.
                 items: {$ref: "#/components/schemas/WriteRecord"}
 
   responses:
@@ -242,7 +248,9 @@ components:
         some did, `502` when none did — so a total provider outage is never reported as success.
 
         Provider APIs are not transactionally atomic across RRsets. If a later RRset fails, a failed
-        zone result may contain records successfully applied before the reported error.
+        zone result may contain records successfully applied before the reported error. If Set
+        replaced values but its TTL change failed, those records carry the prior effective TTL and
+        are omitted when that TTL is unknown.
       content:
         application/json:
           schema:
@@ -310,9 +318,9 @@ components:
         ttl:
           type: integer
           format: int64
-          minimum: 1
-          maximum: 4294967295
-          description: Seconds, in the DNS unsigned 32-bit range.
+          minimum: 60
+          maximum: 2147483647
+          description: Seconds, from Hetzner's minimum through its signed 32-bit maximum.
           example: 300
         data:
           type: string
@@ -359,8 +367,8 @@ components:
         ttl:
           type: integer
           format: int64
-          minimum: 1
-          maximum: 4294967295
+          minimum: 60
+          maximum: 2147483647
           description: Optional and ignored for deletion, but validated when present.
         data:
           type: string

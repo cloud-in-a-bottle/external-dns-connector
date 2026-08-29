@@ -1078,6 +1078,7 @@ func TestSetAndAppendRequirePresentInRangeIntegerTTL(t *testing.T) {
 		{name: "fraction", include: true, value: 1.5},
 		{name: "zero", include: true, value: 0},
 		{name: "negative", include: true, value: -1},
+		{name: "below minimum", include: true, value: records.MinTTLSeconds - 1},
 		{name: "above maximum", include: true, value: uint64(records.MaxTTLSeconds) + 1},
 	}
 
@@ -1143,6 +1144,7 @@ func TestDeleteTTLIsOptionalButValidatedWhenPresent(t *testing.T) {
 		{name: "fraction", value: 1.5},
 		{name: "zero", value: 0},
 		{name: "negative", value: -1},
+		{name: "below minimum", value: records.MinTTLSeconds - 1},
 		{name: "above maximum", value: uint64(records.MaxTTLSeconds) + 1},
 	}
 	for _, tt := range invalid {

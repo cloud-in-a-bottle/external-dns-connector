@@ -160,7 +160,8 @@ func TestWireRejectsBadRecords(t *testing.T) {
 		"ipv6 in an A record": {Name: "www", Type: "A", TTL: 300, Data: "2001:db8::1"},
 		"zero ttl":            {Name: "www", Type: "A", TTL: 0, Data: "192.0.2.1"},
 		"negative ttl":        {Name: "www", Type: "A", TTL: -1, Data: "192.0.2.1"},
-		"ttl above DNS range": {Name: "www", Type: "A", TTL: MaxTTLSeconds + 1, Data: "192.0.2.1"},
+		"below minimum ttl":   {Name: "www", Type: "A", TTL: 59, Data: "192.0.2.1"},
+		"ttl above maximum":   {Name: "www", Type: "A", TTL: MaxTTLSeconds + 1, Data: "192.0.2.1"},
 		"duration overflow":   {Name: "www", Type: "A", TTL: math.MaxInt64, Data: "192.0.2.1"},
 		"unwritable type":     {Name: "www", Type: "SOA", TTL: 300, Data: "ns1. root. 1 2 3 4 5"},
 		"fqdn name":           {Name: "www.example.com", Type: "A", TTL: 300, Data: "192.0.2.1"},
@@ -177,6 +178,9 @@ func TestWireRejectsBadRecords(t *testing.T) {
 }
 
 func TestWireAcceptsTTLBounds(t *testing.T) {
+	if MaxTTLSeconds != 2147483647 {
+		t.Fatalf("MaxTTLSeconds = %d, want Hetzner maximum 2147483647", MaxTTLSeconds)
+	}
 	for _, ttl := range []int64{MinTTLSeconds, MaxTTLSeconds} {
 		wire := Wire{Name: "www", Type: "A", TTL: ttl, Data: "192.0.2.1"}
 		if _, err := wire.ToLibDNS("example.com"); err != nil {
