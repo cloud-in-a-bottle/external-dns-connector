@@ -19,20 +19,39 @@ type fakeLifecycle struct {
 func TestLifecycleTimeoutOrdering(t *testing.T) {
 	if lifecycle.ProviderTimeout != 20*time.Second ||
 		lifecycle.ServiceRequestTimeout != 25*time.Second ||
-		lifecycle.ShutdownTimeout != 30*time.Second ||
+		lifecycle.ShutdownTimeout != 9*time.Second ||
+		lifecycle.PlatformStopTimeout != 10*time.Second ||
 		lifecycle.ServerWriteTimeout != 60*time.Second {
 		t.Fatalf(
-			"timeouts = provider:%s request:%s shutdown:%s write:%s",
+			"timeouts = provider:%s request:%s write:%s shutdown:%s platform-stop:%s",
 			lifecycle.ProviderTimeout,
 			lifecycle.ServiceRequestTimeout,
-			lifecycle.ShutdownTimeout,
 			lifecycle.ServerWriteTimeout,
+			lifecycle.ShutdownTimeout,
+			lifecycle.PlatformStopTimeout,
 		)
 	}
 	if lifecycle.ProviderTimeout >= lifecycle.ServiceRequestTimeout ||
-		lifecycle.ServiceRequestTimeout >= lifecycle.ShutdownTimeout ||
 		lifecycle.ServiceRequestTimeout >= lifecycle.ServerWriteTimeout {
-		t.Fatal("timeouts must satisfy provider < request < shutdown and request < server write")
+		t.Fatal("normal-operation timeouts must satisfy provider < request < server write")
+	}
+	if lifecycle.ShutdownTimeout >= lifecycle.PlatformStopTimeout {
+		t.Fatal("shutdown timeout must be shorter than the platform stop timeout")
+	}
+}
+
+func TestRequestBaseContextCancelsWithShutdown(t *testing.T) {
+	shutdownCtx, cancelShutdown := context.WithCancel(t.Context())
+	requestCtx, cancelRequest := context.WithCancel(requestBaseContext(shutdownCtx)(nil))
+	defer cancelRequest()
+
+	if err := requestCtx.Err(); err != nil {
+		t.Fatalf("request context starts canceled: %v", err)
+	}
+	cancelShutdown()
+	waitForMainSignal(t, requestCtx.Done())
+	if !errors.Is(requestCtx.Err(), context.Canceled) {
+		t.Fatalf("request context error = %v, want context canceled", requestCtx.Err())
 	}
 }
 

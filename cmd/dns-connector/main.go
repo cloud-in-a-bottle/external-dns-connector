@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -56,18 +57,24 @@ func run() error {
 		service.New(st, ops).Handler()))
 	mux.Handle("/", ui.Handler())
 
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           logRequests(mux),
+		BaseContext:       requestBaseContext(shutdownCtx),
 		ReadHeaderTimeout: 10 * time.Second,
 		// Provider operations have their own shorter deadline; this remains the final response bound.
 		WriteTimeout: lifecycle.ServerWriteTimeout,
 	}
 
 	log.Printf("dns-connector listening on %s (app %s)", cfg.ListenAddr, cfg.AppName)
-	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	return serve(shutdownCtx, srv, lifecycle.ShutdownTimeout)
+}
+
+func requestBaseContext(ctx context.Context) func(net.Listener) context.Context {
+	return func(net.Listener) context.Context { return ctx }
 }
 
 type serverLifecycle interface {
