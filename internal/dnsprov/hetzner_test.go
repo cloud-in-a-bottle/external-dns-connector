@@ -143,6 +143,55 @@ func TestHetznerTXTCodecPreservesEveryByteValue(t *testing.T) {
 	}
 }
 
+func TestHetznerRecordParsingFallsBackToOriginalTuple(t *testing.T) {
+	tests := []struct {
+		name           string
+		rrname         string
+		rrtype         hcloud.ZoneRRSetType
+		value          string
+		wantParseError bool
+	}{
+		{
+			name:   "HTTPS parser rewrites owner name",
+			rrname: "_8443._https.test",
+			rrtype: hcloud.ZoneRRSetTypeHTTPS,
+			value:  "0 example.com.",
+		},
+		{
+			name:           "valid provider syntax unsupported by parser",
+			rrname:         "@",
+			rrtype:         hcloud.ZoneRRSetTypeHTTPS,
+			value:          `1 . key=a\;b`,
+			wantParseError: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := hetznerRecordToLibDNS(tt.rrname, tt.rrtype, 60, tt.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := got.(libdns.RR); !ok {
+				t.Fatalf("provider record has type %T, want raw libdns.RR", got)
+			}
+			want := libdns.RR{
+				Name: tt.rrname, Type: string(tt.rrtype), TTL: time.Minute, Data: tt.value,
+			}
+			parsed, parseErr := want.Parse()
+			if tt.wantParseError {
+				if parseErr == nil {
+					t.Fatalf("test record unexpectedly parsed as %T", parsed)
+				}
+			} else if parseErr != nil || parsed.RR().Name == want.Name {
+				t.Fatalf("test record did not exercise tuple rewriting: %T %v", parsed, parseErr)
+			}
+			if got.RR() != want {
+				t.Errorf("provider record = %+v, want %+v", got.RR(), want)
+			}
+		})
+	}
+}
+
 func TestGetRecordsFetchesAllRRSetsAndPreservesTXT(t *testing.T) {
 	p := newScriptedHetznerProvider(t, []hcloudRequest{
 		{
@@ -218,6 +267,112 @@ func TestGetRecordsFetchesAllRRSetsAndPreservesTXT(t *testing.T) {
 	}
 	if _, ok := got[4].(libdns.MX); !ok {
 		t.Errorf("MX record has type %T, want libdns.MX", got[4])
+	}
+}
+
+func TestExactDeleteUsesRawTXTValuesFromGetRecords(t *testing.T) {
+	tests := []struct {
+		name      string
+		actionID  int
+		clear     bool
+		wantBody  string
+		wantCount int
+	}{
+		{
+			name:     "exact logical value",
+			actionID: 80,
+			wantBody: `{
+				"records":[
+					{"value":"\"split\" \" value\"","comment":"split chunks"},
+					{"value":"\"split\\032value\"","comment":"decimal escape"}
+				]
+			}`,
+			wantCount: 2,
+		},
+		{
+			name:     "clear",
+			actionID: 81,
+			clear:    true,
+			wantBody: `{
+				"records":[
+					{"value":"\"split\" \" value\"","comment":"split chunks"},
+					{"value":"\"split\\032value\"","comment":"decimal escape"},
+					{"value":"\"odd\\q\"","comment":"arbitrary escape"}
+				]
+			}`,
+			wantCount: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newScriptedHetznerProvider(t, []hcloudRequest{
+				{
+					method: http.MethodGet,
+					path:   "/zones/example.com",
+					response: `{
+						"zone":{"id":42,"name":"example.com","ttl":60,"record_count":3}
+					}`,
+				},
+				{
+					method: http.MethodGet,
+					path:   "/zones/example.com/rrsets?page=1&per_page=50",
+					response: `{
+						"rrsets":[{
+							"zone":42,
+							"name":"txt",
+							"type":"TXT",
+							"ttl":60,
+							"records":[
+								{"value":"\"split\" \" value\"","comment":"split chunks"},
+								{"value":"\"split\\032value\"","comment":"decimal escape"},
+								{"value":"\"odd\\q\"","comment":"arbitrary escape"}
+							]
+						}],
+						"meta":{"pagination":{"page":1}}
+					}`,
+				},
+				{
+					method:   http.MethodPost,
+					path:     "/zones/example.com/rrsets/txt/TXT/actions/remove_records",
+					body:     tt.wantBody,
+					response: runningAction(tt.actionID),
+				},
+				waitForAction(tt.actionID),
+			})
+
+			got, err := p.GetRecords(t.Context(), "example.com.")
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertRRs(t, got, []libdns.RR{
+				{Name: "txt", Type: "TXT", TTL: time.Minute, Data: "split value"},
+				{Name: "txt", Type: "TXT", TTL: time.Minute, Data: "split value"},
+				{Name: "txt", Type: "TXT", TTL: time.Minute, Data: "oddq"},
+			})
+			toDelete := got[:2]
+			if tt.clear {
+				toDelete = got
+			}
+			deleted, err := p.DeleteRecordsExact(t.Context(), "example.com.", toDelete)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deleted) != tt.wantCount {
+				t.Fatalf("deleted records = %d, want %d", len(deleted), tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestRawRecordIdentityDoesNotCrossProviderInstances(t *testing.T) {
+	first := newScriptedHetznerProvider(t, nil)
+	second := newScriptedHetznerProvider(t, nil)
+	input := txtRecords("value")
+	cacheRawRecords(t, first, "example.com", input)
+
+	if _, err := second.DeleteRecordsExact(t.Context(), "example.com.", input); err == nil ||
+		!strings.Contains(err.Error(), "no raw Hetzner value") {
+		t.Fatalf("second provider exact delete returned %v, want local identity error", err)
 	}
 }
 
@@ -362,7 +517,7 @@ func TestSetRecordsCreatesMissingRRSet(t *testing.T) {
 	}})
 }
 
-func TestSetRecordsReturnsKnownValuesWhenTTLUpdateFails(t *testing.T) {
+func TestSetRecordsTTLActionFailureReturnsNoCurrentRecords(t *testing.T) {
 	p := newScriptedHetznerProvider(t, []hcloudRequest{
 		{
 			method:   http.MethodGet,
@@ -392,64 +547,84 @@ func TestSetRecordsReturnsKnownValuesWhenTTLUpdateFails(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "TTL") {
 		t.Fatalf("SetRecords error = %v, want TTL failure", err)
 	}
-	assertRRs(t, got, []libdns.RR{{
-		Name: "www", Type: "A", TTL: 60 * time.Second, Data: "192.0.2.3",
-	}})
+	if len(got) != 0 {
+		t.Fatalf("indeterminate TTL action returned %d current-plan records", len(got))
+	}
 }
 
-func TestSetRecordsPartialResultUsesKnownZoneDefaultOnly(t *testing.T) {
-	tests := []struct {
-		name      string
-		cacheTTL  bool
-		wantCount int
-	}{
-		{name: "unknown default", wantCount: 0},
-		{name: "cached default", cacheTTL: true, wantCount: 1},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := newScriptedHetznerProvider(t, []hcloudRequest{
-				{
-					method: http.MethodGet,
-					path:   "/zones/example.com/rrsets/www/A",
-					response: `{
-						"rrset":{"zone":42,"name":"www","type":"A","ttl":null}
-					}`,
-				},
-				{
-					method:   http.MethodPost,
-					path:     "/zones/example.com/rrsets/www/A/actions/set_records",
-					body:     `{"records":[{"value":"192.0.2.4"}]}`,
-					response: runningAction(40),
-				},
-				waitForAction(40),
-				{
-					method:   http.MethodPost,
-					path:     "/zones/example.com/rrsets/www/A/actions/change_ttl",
-					body:     `{"ttl":300}`,
-					response: runningAction(41),
-				},
-				failedAction(41, "invalid_ttl", "TTL update failed"),
-			})
-			if tt.cacheTTL {
-				p.zoneTTLs.Store("example.com", 120)
-			}
+func TestSetRecordsTTLRequestFailureReturnsNoCurrentRecords(t *testing.T) {
+	p := newScriptedHetznerProvider(t, []hcloudRequest{
+		{
+			method:   http.MethodGet,
+			path:     "/zones/example.com/rrsets/www/A",
+			response: `{"rrset":{"zone":42,"name":"www","type":"A","ttl":60}}`,
+		},
+		{
+			method:   http.MethodPost,
+			path:     "/zones/example.com/rrsets/www/A/actions/set_records",
+			body:     `{"records":[{"value":"192.0.2.4"}]}`,
+			response: runningAction(40),
+		},
+		waitForAction(40),
+		{
+			method: http.MethodPost,
+			path:   "/zones/example.com/rrsets/www/A/actions/change_ttl",
+			body:   `{"ttl":300}`,
+			status: http.StatusUnprocessableEntity,
+			response: `{
+				"error":{"code":"invalid_input","message":"TTL update failed"}
+			}`,
+		},
+	})
 
-			got, err := p.SetRecords(t.Context(), "example.com.", []libdns.Record{
-				libdns.RR{Name: "www", Type: "A", TTL: 300 * time.Second, Data: "192.0.2.4"},
-			})
-			if err == nil {
-				t.Fatal("SetRecords should report the TTL failure")
-			}
-			if len(got) != tt.wantCount {
-				t.Fatalf("partial records = %d, want %d", len(got), tt.wantCount)
-			}
-			if tt.cacheTTL {
-				assertRRs(t, got, []libdns.RR{{
-					Name: "www", Type: "A", TTL: 120 * time.Second, Data: "192.0.2.4",
-				}})
-			}
-		})
+	got, err := p.SetRecords(t.Context(), "example.com.", []libdns.Record{
+		libdns.RR{Name: "www", Type: "A", TTL: 300 * time.Second, Data: "192.0.2.4"},
+	})
+	if err == nil {
+		t.Fatal("SetRecords should report the TTL request failure")
+	}
+	if len(got) != 0 {
+		t.Fatalf("indeterminate TTL request returned %d current-plan records", len(got))
+	}
+}
+
+func TestSetRecordsTTLActionTimeoutReturnsNoCurrentRecords(t *testing.T) {
+	p := newScriptedHetznerProvider(t, []hcloudRequest{
+		{
+			method:   http.MethodGet,
+			path:     "/zones/example.com/rrsets/www/A",
+			response: `{"rrset":{"zone":42,"name":"www","type":"A","ttl":60}}`,
+		},
+		{
+			method:   http.MethodPost,
+			path:     "/zones/example.com/rrsets/www/A/actions/set_records",
+			body:     `{"records":[{"value":"192.0.2.5"}]}`,
+			response: runningAction(90),
+		},
+		waitForAction(90),
+		{
+			method:   http.MethodPost,
+			path:     "/zones/example.com/rrsets/www/A/actions/change_ttl",
+			body:     `{"ttl":300}`,
+			response: runningAction(91),
+		},
+		{
+			method:              http.MethodGet,
+			path:                "/actions/91",
+			waitForCancellation: true,
+		},
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	got, err := p.SetRecords(ctx, "example.com.", []libdns.Record{
+		libdns.RR{Name: "www", Type: "A", TTL: 300 * time.Second, Data: "192.0.2.5"},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("SetRecords error = %v, want context deadline", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("timed-out TTL action returned %d current-plan records", len(got))
 	}
 }
 
@@ -488,6 +663,7 @@ func TestAppendAndDeleteGroupValuesByRRSet(t *testing.T) {
 			waitForAction(21),
 		})
 		input := txtRecords("one", "two")
+		cacheRawRecords(t, p, "example.com", input)
 		got, err := p.DeleteRecordsExact(t.Context(), "example.com.", input)
 		if err != nil {
 			t.Fatal(err)
@@ -536,6 +712,49 @@ func TestDeleteRecordsChecksCurrentValueAndTTL(t *testing.T) {
 	assertRRs(t, got, []libdns.RR{{
 		Name: "txt", Type: "TXT", TTL: 60 * time.Second, Data: "two",
 	}})
+}
+
+func TestDeleteRecordsMatchesAllRawTXTRepresentations(t *testing.T) {
+	p := newScriptedHetznerProvider(t, []hcloudRequest{
+		{
+			method: http.MethodGet,
+			path:   "/zones/example.com/rrsets/txt/TXT",
+			response: `{
+				"rrset":{
+					"zone":42,
+					"name":"txt",
+					"type":"TXT",
+					"ttl":60,
+					"records":[
+						{"value":"\"split\" \" value\"","comment":"chunks"},
+						{"value":"\"split\\032value\"","comment":"decimal"}
+					]
+				}
+			}`,
+		},
+		{
+			method: http.MethodPost,
+			path:   "/zones/example.com/rrsets/txt/TXT/actions/remove_records",
+			body: `{
+				"records":[
+					{"value":"\"split\" \" value\"","comment":"chunks"},
+					{"value":"\"split\\032value\"","comment":"decimal"}
+				]
+			}`,
+			response: runningAction(82),
+		},
+		waitForAction(82),
+	})
+
+	deleted, err := p.DeleteRecords(t.Context(), "example.com.", []libdns.Record{
+		libdns.TXT{Name: "txt", TTL: time.Minute, Text: "split value"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != 2 {
+		t.Fatalf("deleted records = %d, want both raw representations", len(deleted))
+	}
 }
 
 func TestDeleteRecordsResolvesZoneDefaultTTL(t *testing.T) {
@@ -675,7 +894,9 @@ func TestMutationActionsWithEmptyErrorDetailsStillFail(t *testing.T) {
 				failedAction(63, "", ""),
 			},
 			call: func(p *hetznerProvider) ([]libdns.Record, error) {
-				return p.DeleteRecordsExact(t.Context(), "example.com.", txtRecords("one"))
+				input := txtRecords("one")
+				cacheRawRecords(t, p, "example.com", input)
+				return p.DeleteRecordsExact(t.Context(), "example.com.", input)
 			},
 		},
 	}
@@ -905,11 +1126,12 @@ func TestHetznerProviderClientConstructionIsInjectable(t *testing.T) {
 }
 
 type hcloudRequest struct {
-	method   string
-	path     string
-	body     string
-	status   int
-	response string
+	method              string
+	path                string
+	body                string
+	status              int
+	response            string
+	waitForCancellation bool
 }
 
 func newScriptedHetznerProvider(t *testing.T, expected []hcloudRequest) *hetznerProvider {
@@ -940,6 +1162,10 @@ func newScriptedHetznerProvider(t *testing.T, expected []hcloudRequest) *hetzner
 			t.Errorf("read hcloud request body: %v", err)
 		}
 		assertJSONBody(t, body, want.body)
+		if want.waitForCancellation {
+			<-r.Context().Done()
+			return
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		status := want.status
@@ -1023,6 +1249,25 @@ func assertJSONBody(t *testing.T, got []byte, want string) {
 	if !reflect.DeepEqual(gotValue, wantValue) {
 		t.Errorf("request JSON = %s, want %s", got, want)
 	}
+}
+
+func cacheRawRecords(
+	t *testing.T,
+	p *hetznerProvider,
+	zone string,
+	input []libdns.Record,
+) {
+	t.Helper()
+	replacement := make(map[hetznerRawRecordKey][]hcloud.ZoneRRSetRecord)
+	for _, record := range input {
+		normalized, value, _, err := libDNSRecordToHetzner(zone, record, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := newHetznerRawRecordKey(zone, normalized)
+		replacement[key] = append(replacement[key], hcloud.ZoneRRSetRecord{Value: value})
+	}
+	p.replaceRawRecords(zone, replacement)
 }
 
 func txtRecords(values ...string) []libdns.Record {

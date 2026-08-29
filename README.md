@@ -70,8 +70,8 @@ every zone succeeded, `207` when some did, `502` when none did.
 Provider APIs are not transactionally atomic across RRsets. If one zone request changes multiple
 RRsets and a later RRset fails, earlier changes remain applied. A failed zone result may therefore
 contain `records` that were successfully applied before its `error`; callers should inspect both.
-If Set replaced values but its separate TTL change failed, those records carry the prior effective
-TTL. They are omitted when that TTL is not known.
+If Set replaced values but its separate TTL change failed, that current RRset is omitted because its
+final TTL is indeterminate. Records from prior fully completed RRsets remain reported.
 
 ### Records
 

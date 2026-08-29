@@ -26,6 +26,8 @@ type hetznerProvider struct {
 	client             *hcloud.Client
 	actionPollInterval time.Duration
 	zoneTTLs           sync.Map
+	rawRecordsMu       sync.RWMutex
+	rawRecords         map[hetznerRawRecordKey][]hcloud.ZoneRRSetRecord
 }
 
 type hetznerClientFactory func(token string) *hcloud.Client
@@ -82,6 +84,7 @@ func (p *hetznerProvider) GetRecords(ctx context.Context, zone string) ([]libdns
 		return nil, fmt.Errorf("list Hetzner RRsets for %s: %w", zone, err)
 	}
 	result := make([]libdns.Record, 0, hcloudZone.RecordCount)
+	rawRecords := make(map[hetznerRawRecordKey][]hcloud.ZoneRRSetRecord)
 	for _, set := range sets {
 		ttl := hcloudZone.TTL
 		if set.TTL != nil {
@@ -93,8 +96,11 @@ func (p *hetznerProvider) GetRecords(ctx context.Context, zone string) ([]libdns
 				return nil, fmt.Errorf("parse Hetzner RRset %s/%s: %w", set.Name, set.Type, err)
 			}
 			result = append(result, record)
+			key := newHetznerRawRecordKey(zone, record)
+			rawRecords[key] = append(rawRecords[key], value)
 		}
 	}
+	p.replaceRawRecords(zone, rawRecords)
 	return result, nil
 }
 
@@ -169,8 +175,6 @@ func (p *hetznerProvider) SetRecords(
 			return applied, fmt.Errorf("preserve Hetzner RRset %s/%s comments: %w",
 				set.name, set.rrtype, err)
 		}
-		previousTTL, previousTTLKnown := p.knownRRsetTTL(zone, existing)
-
 		action, _, err := p.client.Zone.SetRRSetRecords(ctx, target, hcloud.ZoneRRSetSetRecordsOpts{
 			Records: set.values,
 		})
@@ -190,12 +194,10 @@ func (p *hetznerProvider) SetRecords(
 			TTL: &set.ttl,
 		})
 		if err != nil {
-			partial := appendKnownTTL(applied, set, previousTTL, previousTTLKnown)
-			return partial, fmt.Errorf("set Hetzner RRset %s/%s TTL: %w", set.name, set.rrtype, err)
+			return applied, fmt.Errorf("set Hetzner RRset %s/%s TTL: %w", set.name, set.rrtype, err)
 		}
 		if err := p.waitForAction(ctx, ttlAction); err != nil {
-			partial := appendKnownTTL(applied, set, previousTTL, previousTTLKnown)
-			return partial, fmt.Errorf(
+			return applied, fmt.Errorf(
 				"wait for Hetzner RRset %s/%s TTL change: %w",
 				set.name,
 				set.rrtype,
@@ -224,7 +226,7 @@ func (p *hetznerProvider) DeleteRecords(
 			)
 		}
 	}
-	zone, sets, err := groupHetznerRecords(zone, recordsToDelete, false)
+	zone, sets, err := groupHetznerDeleteRecords(zone, recordsToDelete)
 	if err != nil {
 		return nil, err
 	}
@@ -235,14 +237,17 @@ func (p *hetznerProvider) DeleteRecords(
 	return p.removeHetznerRecords(ctx, zone, matched)
 }
 
-// DeleteRecordsExact is the planner-only path for records matched against a fresh provider read.
+// DeleteRecordsExact is the planner-only path for records matched by this instance's fresh read.
 func (p *hetznerProvider) DeleteRecordsExact(
 	ctx context.Context,
 	zone string,
 	recordsToDelete []libdns.Record,
 ) ([]libdns.Record, error) {
-	zone, sets, err := groupHetznerRecords(zone, recordsToDelete, false)
+	zone, sets, err := groupHetznerDeleteRecords(zone, recordsToDelete)
 	if err != nil {
+		return nil, err
+	}
+	if err := p.useRawRecordsForExactDelete(zone, sets); err != nil {
 		return nil, err
 	}
 	return p.removeHetznerRecords(ctx, zone, sets)
@@ -274,38 +279,40 @@ func (p *hetznerProvider) matchDeleteRecords(
 				set.name, set.rrtype, err)
 		}
 
-		existingByValue := make(map[string]hcloud.ZoneRRSetRecord, len(existing.Records))
+		existingByValue := make(map[string][]hcloud.ZoneRRSetRecord, len(existing.Records))
 		for _, record := range existing.Records {
 			value, err := logicalHetznerValue(set.rrtype, record.Value)
 			if err != nil {
 				return nil, fmt.Errorf("decode Hetzner RRset %s/%s value: %w",
 					set.name, set.rrtype, err)
 			}
-			existingByValue[value] = record
+			existingByValue[value] = append(existingByValue[value], record)
 		}
 
 		matches := &hetznerRRSet{name: set.name, rrtype: set.rrtype}
+		matchedValues := make(map[string]bool)
 		for _, requestedRecord := range set.records {
 			rr := requestedRecord.RR()
 			if rr.TTL != 0 && rr.TTL != time.Duration(ttl)*time.Second {
 				continue
 			}
-			existingRecord, ok := existingByValue[rr.Data]
-			if !ok {
+			if matchedValues[rr.Data] {
 				continue
 			}
-			matchedRecord, err := hetznerRecordToLibDNS(
-				set.name,
-				set.rrtype,
-				ttl,
-				existingRecord.Value,
-			)
-			if err != nil {
-				return nil, err
+			for _, existingRecord := range existingByValue[rr.Data] {
+				matchedRecord, err := hetznerRecordToLibDNS(
+					set.name,
+					set.rrtype,
+					ttl,
+					existingRecord.Value,
+				)
+				if err != nil {
+					return nil, err
+				}
+				matches.values = append(matches.values, existingRecord)
+				matches.records = append(matches.records, matchedRecord)
 			}
-			matches.values = append(matches.values, existingRecord)
-			matches.records = append(matches.records, matchedRecord)
-			delete(existingByValue, rr.Data)
+			matchedValues[rr.Data] = true
 		}
 		if len(matches.records) > 0 {
 			matched = append(matched, matches)
@@ -433,6 +440,14 @@ type hetznerRRSetKey struct {
 	rrtype hcloud.ZoneRRSetType
 }
 
+type hetznerRawRecordKey struct {
+	zone   string
+	name   string
+	rrtype string
+	ttl    time.Duration
+	data   string
+}
+
 func (s *hetznerRRSet) target(zone string) *hcloud.ZoneRRSet {
 	return &hcloud.ZoneRRSet{
 		Zone: &hcloud.Zone{Name: zone},
@@ -470,32 +485,62 @@ func (p *hetznerProvider) knownRRsetTTL(zone string, set *hcloud.ZoneRRSet) (int
 	return ttl, ok
 }
 
-func appendKnownTTL(
-	applied []libdns.Record,
-	set *hetznerRRSet,
-	ttl int,
-	known bool,
-) []libdns.Record {
-	if !known {
-		return applied
-	}
-	for _, record := range set.records {
-		rr := record.RR()
-		rr.TTL = time.Duration(ttl) * time.Second
-		withTTL, err := rr.Parse()
-		if err != nil {
-			withTTL = rr
-		}
-		applied = append(applied, withTTL)
-	}
-	return applied
-}
-
 func logicalHetznerValue(rrtype hcloud.ZoneRRSetType, value string) (string, error) {
 	if strings.EqualFold(string(rrtype), "TXT") {
 		return decodeHetznerTXT(value)
 	}
 	return value, nil
+}
+
+func newHetznerRawRecordKey(zone string, record libdns.Record) hetznerRawRecordKey {
+	rr := record.RR()
+	return hetznerRawRecordKey{
+		zone: zone, name: rr.Name, rrtype: rr.Type, ttl: rr.TTL, data: rr.Data,
+	}
+}
+
+func (p *hetznerProvider) replaceRawRecords(
+	zone string,
+	replacement map[hetznerRawRecordKey][]hcloud.ZoneRRSetRecord,
+) {
+	p.rawRecordsMu.Lock()
+	defer p.rawRecordsMu.Unlock()
+	if p.rawRecords == nil {
+		p.rawRecords = make(map[hetznerRawRecordKey][]hcloud.ZoneRRSetRecord)
+	}
+	for key := range p.rawRecords {
+		if key.zone == zone {
+			delete(p.rawRecords, key)
+		}
+	}
+	for key, values := range replacement {
+		p.rawRecords[key] = append([]hcloud.ZoneRRSetRecord(nil), values...)
+	}
+}
+
+func (p *hetznerProvider) useRawRecordsForExactDelete(
+	zone string,
+	sets []*hetznerRRSet,
+) error {
+	p.rawRecordsMu.RLock()
+	defer p.rawRecordsMu.RUnlock()
+	used := make(map[hetznerRawRecordKey]int)
+	for _, set := range sets {
+		rawValues := make([]hcloud.ZoneRRSetRecord, 0, len(set.records))
+		for _, record := range set.records {
+			key := newHetznerRawRecordKey(zone, record)
+			index := used[key]
+			values := p.rawRecords[key]
+			if index >= len(values) {
+				return fmt.Errorf("no raw Hetzner value for exact delete of %s/%s",
+					set.name, set.rrtype)
+			}
+			rawValues = append(rawValues, values[index])
+			used[key]++
+		}
+		set.values = rawValues
+	}
+	return nil
 }
 
 func groupHetznerRecords(
@@ -540,6 +585,44 @@ func groupHetznerRecords(
 				records.MaxRRSetMembers,
 			)
 		}
+	}
+	return zone, sets, nil
+}
+
+func groupHetznerDeleteRecords(
+	zone string,
+	input []libdns.Record,
+) (string, []*hetznerRRSet, error) {
+	zone, err := records.ValidateZone(zone)
+	if err != nil {
+		return "", nil, err
+	}
+	byKey := make(map[hetznerRRSetKey]*hetznerRRSet)
+	sets := make([]*hetznerRRSet, 0)
+	for i, record := range input {
+		if record == nil {
+			return "", nil, fmt.Errorf("record %d is nil", i)
+		}
+		rr := record.RR()
+		name, err := records.NormalizeName(rr.Name, zone)
+		if err != nil {
+			return "", nil, fmt.Errorf("record %d: %w", i, err)
+		}
+		rrtype, err := records.NormalizeType(rr.Type)
+		if err != nil {
+			return "", nil, fmt.Errorf("record %d: %w", i, err)
+		}
+		normalized := libdns.RR{
+			Name: name, Type: rrtype, TTL: rr.TTL, Data: rr.Data,
+		}
+		key := hetznerRRSetKey{name: name, rrtype: hcloud.ZoneRRSetType(rrtype)}
+		set, ok := byKey[key]
+		if !ok {
+			set = &hetznerRRSet{name: name, rrtype: key.rrtype}
+			byKey[key] = set
+			sets = append(sets, set)
+		}
+		set.records = append(set.records, normalized)
 	}
 	return zone, sets, nil
 }
@@ -628,12 +711,22 @@ func hetznerRecordToLibDNS(
 			return nil, err
 		}
 	}
-	return libdns.RR{
+	raw := libdns.RR{
 		Name: name,
 		Type: typeName,
 		TTL:  time.Duration(ttl) * time.Second,
 		Data: value,
-	}.Parse()
+	}
+	parsed, err := raw.Parse()
+	if err != nil {
+		return raw, nil
+	}
+	parsedRR := parsed.RR()
+	if parsedRR.Name != raw.Name || parsedRR.Type != raw.Type ||
+		parsedRR.Data != raw.Data || parsedRR.TTL != raw.TTL {
+		return raw, nil
+	}
+	return parsed, nil
 }
 
 func decodeHetznerTXT(value string) (string, error) {

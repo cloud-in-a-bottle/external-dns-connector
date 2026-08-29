@@ -449,21 +449,21 @@ func TestMutationReturnsAppliedRRsetsWhenLaterRRsetFails(t *testing.T) {
 
 func TestMutationIncludesOnlyCurrentPlanProviderResultOnError(t *testing.T) {
 	first := testRR("a", "TXT", "applied", 60)
-	second := testRR("b", "TXT", "values-applied-before-ttl-failed", 300)
-	secondAtOldTTL := testRR("b", "TXT", "values-applied-before-ttl-failed", 60)
+	second := testRR("b", "TXT", "provider-reported-partial", 300)
+	providerPartial := testRR("b", "TXT", "provider-reported-partial", 60)
 	unrelated := testRR("outside", "TXT", "must-not-leak-into-result", 60)
 	failure := errors.New("TTL change failed")
 	p := &mutationProvider{
 		setErr:       failure,
 		setErrCall:   2,
-		setErrResult: []libdns.Record{secondAtOldTTL, unrelated},
+		setErrResult: []libdns.Record{providerPartial, unrelated},
 	}
 
 	got, err := runMutation(t, p, OpSet, []libdns.Record{second, first}, nil)
 	if !errors.Is(err, failure) {
 		t.Fatalf("set returned %v, want %v", err, failure)
 	}
-	assertRecords(t, got, []libdns.Record{first, secondAtOldTTL})
+	assertRecords(t, got, []libdns.Record{first, providerPartial})
 	assertProviderCalls(t, p, 1, 2, 0, 0)
 }
 

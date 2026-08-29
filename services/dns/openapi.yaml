@@ -249,8 +249,8 @@ components:
 
         Provider APIs are not transactionally atomic across RRsets. If a later RRset fails, a failed
         zone result may contain records successfully applied before the reported error. If Set
-        replaced values but its TTL change failed, those records carry the prior effective TTL and
-        are omitted when that TTL is unknown.
+        replaced values but its TTL change failed, that current RRset is omitted because its final
+        TTL is indeterminate.
       content:
         application/json:
           schema:

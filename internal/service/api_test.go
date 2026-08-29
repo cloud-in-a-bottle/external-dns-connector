@@ -456,6 +456,48 @@ func TestGetFanOutMixedResultsReturnsMultiStatus(t *testing.T) {
 	}
 }
 
+func TestGetAuthorizationUsesProviderOriginalTuple(t *testing.T) {
+	original := libdns.RR{
+		Name: "_8443._https.test",
+		Type: "HTTPS",
+		TTL:  time.Minute,
+		Data: "0 example.com.",
+	}
+	ops := &fakeRecordOperations{
+		zones: []store.Zone{{Zone: zoneA}},
+		getFn: func(context.Context, store.Zone) ([]libdns.Record, error) {
+			return []libdns.Record{original}, nil
+		},
+	}
+	handler := newAPI(nil, ops).Handler()
+
+	_, visible, _ := call(
+		t,
+		handler,
+		"/records/get",
+		map[string]any{"zone": zoneA},
+		globalGrant(original.Name, original.Type, "r"),
+	)
+	if len(visible.Results) != 1 || len(visible.Results[0].Records) != 1 {
+		t.Fatalf("original tuple grant did not reveal record: %+v", visible)
+	}
+	if got := visible.Results[0].Records[0]; got.Name != original.Name || got.Type != original.Type {
+		t.Fatalf("visible tuple = %s/%s, want %s/%s", got.Name, got.Type,
+			original.Name, original.Type)
+	}
+
+	_, hidden, _ := call(
+		t,
+		handler,
+		"/records/get",
+		map[string]any{"zone": zoneA},
+		globalGrant("_8443.test", original.Type, "r"),
+	)
+	if len(hidden.Results) != 1 || len(hidden.Results[0].Records) != 0 {
+		t.Fatalf("rewritten tuple grant revealed provider record: %+v", hidden)
+	}
+}
+
 func TestGetRequiresBodyAndAcceptsEmptyObject(t *testing.T) {
 	handler := newTestAPI(t)
 	permissions := globalGrant("**", "**", "r")
